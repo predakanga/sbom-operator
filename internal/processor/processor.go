@@ -396,6 +396,54 @@ func (p *Processor) executeSyftScans(pods []libk8s.PodInfo, allImages []*liboci.
 	}
 }
 
+// findPodsToScan returns the pods that have at least one container whose image
+// is missing from any of the targets (one image list per target) and isn't
+// annotated as processed. It also returns every image running in pods,
+// deduplicated, which is what orphan detection compares the targets against.
+func (p *Processor) findPodsToScan(pods []libk8s.PodInfo, targetImages [][]*liboci.RegistryImage) ([]libk8s.PodInfo, []*liboci.RegistryImage) {
+	targetImageSets := make([]map[string]bool, 0, len(targetImages))
+	for _, images := range targetImages {
+		set := make(map[string]bool, len(images))
+		for _, i := range images {
+			set[i.ImageID] = true
+		}
+		targetImageSets = append(targetImageSets, set)
+	}
+
+	missingPods := make([]libk8s.PodInfo, 0)
+	allImages := make([]*liboci.RegistryImage, 0)
+	seenImages := make(map[string]bool)
+
+	for _, info := range pods {
+		needsAnalysis := false
+		for _, c := range info.Containers {
+			// every container counts as running, also those after the first one needing analysis
+			if !seenImages[c.Image.ImageID] {
+				seenImages[c.Image.ImageID] = true
+				allImages = append(allImages, c.Image)
+			}
+
+			if needsAnalysis || p.K8s.HasAnnotation(info.Annotations, c) {
+				continue
+			}
+
+			for _, set := range targetImageSets {
+				if !set[c.Image.ImageID] {
+					needsAnalysis = true
+					break
+				}
+			}
+		}
+
+		if needsAnalysis {
+			missingPods = append(missingPods, info)
+			logrus.Debugf("Pod %s/%s needs to be analyzed", info.PodNamespace, info.PodName)
+		}
+	}
+
+	return missingPods, allImages
+}
+
 func (p *Processor) executeJobImage(pods []libk8s.PodInfo) {
 	jobClient := job.New(
 		p.K8s,
@@ -557,38 +605,30 @@ func (p *Processor) runInformerAsync(informer cache.SharedIndexInformer) {
 			}
 
 			logrus.Info("Finished cache sync")
-			pods := informer.GetStore().List()
-			missingPods := make([]libk8s.PodInfo, 0)
-			allImages := make([]*liboci.RegistryImage, 0)
+			pods := make([]libk8s.PodInfo, 0)
+			for _, po := range informer.GetStore().List() {
+				pod := po.(*corev1.Pod)
 
+				// Filter by namespace if selector is configured
+				if !p.isNamespaceAllowed(pod.Namespace) {
+					logrus.Tracef("Skipping pod %s/%s during initial sync - namespace not in allowed list", pod.Namespace, pod.Name)
+					continue
+				}
+
+				pods = append(pods, p.K8s.Client.ExtractPodInfos(*pod))
+			}
+
+			targetImages := make([][]*liboci.RegistryImage, 0, len(p.Targets))
 			for _, t := range p.Targets {
-				targetImages, err := t.LoadImages()
+				images, err := t.LoadImages()
 				if err != nil {
 					logrus.WithError(err).Error("Failed to load images from target")
 					continue
 				}
-
-				for _, po := range pods {
-					pod := po.(*corev1.Pod)
-
-					// Filter by namespace if selector is configured
-					if !p.isNamespaceAllowed(pod.Namespace) {
-						logrus.Tracef("Skipping pod %s/%s during initial sync - namespace not in allowed list", pod.Namespace, pod.Name)
-						continue
-					}
-
-					info := p.K8s.Client.ExtractPodInfos(*pod)
-					for _, c := range info.Containers {
-						allImages = append(allImages, c.Image)
-						if !containsImage(targetImages, c.Image.ImageID) && !p.K8s.HasAnnotation(info.Annotations, c) {
-							missingPods = append(missingPods, info)
-							logrus.Debugf("Pod %s/%s needs to be analyzed", info.PodNamespace, info.PodName)
-							break
-						}
-					}
-				}
+				targetImages = append(targetImages, images)
 			}
 
+			missingPods, allImages := p.findPodsToScan(pods, targetImages)
 			if len(missingPods) > 0 {
 				p.executeSyftScans(missingPods, allImages)
 			}
