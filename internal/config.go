@@ -32,6 +32,7 @@ type Config struct {
 	DtrackUseShortName               bool     `yaml:"dtrackUseShortName" env:"SBOM_DTRACK_USE_SHORT_NAME" flag:"dtrack-use-short-name"`
 	DtrackManageProjectActiveStatus  bool     `yaml:"dtrackManageProjectActiveStatus" env:"SBOM_DTRACK_MANAGE_PROJECT_ACTIVE_STATUS" flag:"dtrack-manage-project-active-status"`
 	DtrackKubernetesClusterIdMode    string   `yaml:"dtrackKubernetesClusterIdMode" env:"SBOM_DTRACK_KUBERNETES_CLUSTER_ID_MODE" flag:"dtrack-kubernetes-cluster-id-mode"`
+	DtrackTimeout                    string   `yaml:"dtrackTimeout" env:"SBOM_DTRACK_TIMEOUT" flag:"dtrack-timeout"`
 	KubernetesClusterId              string   `yaml:"kubernetesClusterId" env:"SBOM_KUBERNETES_CLUSTER_ID" flag:"kubernetes-cluster-id"`
 	JobImage                         string   `yaml:"jobImage" env:"SBOM_JOB_IMAGE" flag:"job-image"`
 	JobImagePullSecret               string   `yaml:"jobImagePullSecret" env:"SBOM_JOB_IMAGE_PULL_SECRET" flag:"job-image-pull-secret"`
@@ -79,6 +80,7 @@ var (
 	ConfigKeyDependencyTrackDtrackProjectNameAnnotationKey   = "dtrack-project-name-annotation-key"
 	ConfigKeyDependencyTrackUseShortName                     = "dtrack-use-short-name"
 	ConfigKeyDependencyTrackManageProjectActiveStatus        = "dtrack-manage-project-active-status"
+	ConfigKeyDependencyTrackTimeout                          = "dtrack-timeout"
 	ConfigKeyKubernetesClusterId                             = "kubernetes-cluster-id"
 	ConfigKeyJobImage                                        = "job-image"
 	ConfigKeyFetchOciAttestations                            = "fetch-oci-attestations"

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	dtrack "github.com/DependencyTrack/client-go"
 	libk8s_real "github.com/ckotzbauer/libk8soci/pkg/kubernetes"
@@ -149,7 +150,7 @@ func TestGetScopeFromAnnotationKey(t *testing.T) {
 }
 
 func TestNewDependencyTrackTarget(t *testing.T) {
-	target := NewDependencyTrackTarget("url", "api", "matcher", "ca", "cert", "key", "cluster", "tag", "parent", "p-ann", "n-ann", true, true)
+	target := NewDependencyTrackTarget("url", "api", "matcher", "ca", "cert", "key", "cluster", "tag", "parent", "p-ann", "n-ann", true, true, "")
 	assert.Equal(t, "url", target.baseUrl)
 	assert.Equal(t, "api", target.apiKey)
 	assert.Equal(t, "matcher", target.podLabelTagMatcher)
@@ -171,12 +172,67 @@ func TestInitialize(t *testing.T) {
 	}
 	err := target.Initialize()
 	assert.NoError(t, err)
-	assert.Len(t, target.clientOptions, 1)
+	assert.Len(t, target.clientOptions, 2)
 
 	target.caCertFile = "ca.crt"
 	err = target.Initialize()
 	assert.NoError(t, err)
-	assert.Len(t, target.clientOptions, 2)
+	assert.Len(t, target.clientOptions, 3)
+}
+
+func TestParseTimeout(t *testing.T) {
+	tests := []struct {
+		value    string
+		expected time.Duration
+		wantErr  bool
+	}{
+		{value: "", expected: DefaultTimeout},
+		{value: "  ", expected: DefaultTimeout},
+		{value: "90s", expected: 90 * time.Second},
+		{value: "2m30s", expected: 150 * time.Second},
+		{value: "500ms", expected: 500 * time.Millisecond},
+		{value: "45", expected: 45 * time.Second},
+		{value: "0", wantErr: true},
+		{value: "-5s", wantErr: true},
+		{value: "soon", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			timeout, err := parseTimeout(tt.value)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, timeout)
+		})
+	}
+}
+
+func TestTimeoutIsApplied(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer ts.Close()
+	defer close(release)
+
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false, "200ms")
+	require.NoError(t, g.ValidateConfig())
+	require.NoError(t, g.Initialize())
+
+	ctx := &target.TargetContext{
+		Image:      &liboci.RegistryImage{ImageID: "alpine:3.14", Image: "alpine:3.14"},
+		Pod:        &libk8s_real.PodInfo{PodNamespace: "default"},
+		Containers: []*libk8s_real.ContainerInfo{{Name: "alpine"}},
+		Sbom:       "{}",
+	}
+
+	start := time.Now()
+	err := g.ProcessSbom(ctx)
+	assert.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second)
 }
 
 func TestValidateConfig(t *testing.T) {
@@ -215,6 +271,24 @@ func TestValidateConfig(t *testing.T) {
 				defaultParentProject: "invalid-uuid",
 			},
 			wantErr: true,
+		},
+		{
+			name: "Invalid timeout",
+			target: &DependencyTrackTarget{
+				baseUrl: "http://localhost:8080",
+				apiKey:  "apikey",
+				timeout: "soon",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Valid timeout",
+			target: &DependencyTrackTarget{
+				baseUrl: "http://localhost:8080",
+				apiKey:  "apikey",
+				timeout: "2m",
+			},
+			wantErr: false,
 		},
 		{
 			name: "Missing client cert/key for mTLS",
@@ -276,7 +350,7 @@ func TestProcessSbomUnsupportedMediaType(t *testing.T) {
 		Sbom:       "{}",
 		MediaType:  "unsupported",
 	}
-	g := NewDependencyTrackTarget("", "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false)
+	g := NewDependencyTrackTarget("", "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false, "")
 	err := g.ProcessSbom(ctx)
 	assert.NoError(t, err)
 }
@@ -318,7 +392,7 @@ func TestProcessSbomMinimal(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
@@ -400,7 +474,7 @@ func TestProcessSbomParentProject(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "my.parent.project", "", true, false)
+			g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "my.parent.project", "", true, false, "")
 			err := g.Initialize()
 			assert.NoError(t, err)
 			// Pre-populate so LoadImages is skipped during ProcessSbom.
@@ -437,7 +511,7 @@ func TestRemoveMinimal(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
@@ -535,7 +609,7 @@ func TestLoadImagesResetsImageProjectMap(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
@@ -580,7 +654,7 @@ func TestLoadImagesTagMode(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
@@ -631,7 +705,7 @@ func TestProcessSbomReactivateWithoutUpload(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "8c940608-8e62-431a-ac5d-2092b7c41372", "", true, true)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "8c940608-8e62-431a-ac5d-2092b7c41372", "", true, true, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
@@ -704,7 +778,7 @@ func TestProcessSbomDeactivatesSiblings(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "8c940608-8e62-431a-ac5d-2092b7c41372", "", true, true)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "8c940608-8e62-431a-ac5d-2092b7c41372", "", true, true, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
@@ -758,7 +832,7 @@ func TestDeactivate(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, true)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, true, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
@@ -829,7 +903,7 @@ func TestDeactivateTagModeMultiCluster(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, true)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, true, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
@@ -881,7 +955,7 @@ func TestLoadImagesSkipsInactiveProjects(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, true)
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, true, "")
 	err := g.Initialize()
 	assert.NoError(t, err)
 
