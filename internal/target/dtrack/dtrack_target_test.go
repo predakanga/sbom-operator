@@ -11,6 +11,7 @@ import (
 	dtrack "github.com/DependencyTrack/client-go"
 	libk8s_real "github.com/ckotzbauer/libk8soci/pkg/kubernetes"
 	liboci "github.com/ckotzbauer/libk8soci/pkg/oci"
+	"github.com/ckotzbauer/sbom-operator/internal/oci"
 	"github.com/ckotzbauer/sbom-operator/internal/target"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
@@ -278,6 +279,27 @@ func TestProcessSbomUnsupportedMediaType(t *testing.T) {
 	g := NewDependencyTrackTarget("", "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false)
 	err := g.ProcessSbom(ctx)
 	assert.NoError(t, err)
+}
+
+func TestAcceptsMediaType(t *testing.T) {
+	tests := []struct {
+		mediaType string
+		expected  bool
+	}{
+		{mediaType: "", expected: true},
+		{mediaType: oci.CycloneDXJSONMediaType, expected: true},
+		{mediaType: oci.CycloneDXXMLMediaType, expected: true},
+		{mediaType: oci.SPDXJSONMediaType, expected: false},
+		{mediaType: oci.SPDXMediaType, expected: false},
+		{mediaType: oci.SyftMediaType, expected: false},
+	}
+
+	g := &DependencyTrackTarget{}
+	for _, tt := range tests {
+		t.Run(tt.mediaType, func(t *testing.T) {
+			assert.Equal(t, tt.expected, g.AcceptsMediaType(tt.mediaType))
+		})
+	}
 }
 
 func TestProcessSbomMinimal(t *testing.T) {
