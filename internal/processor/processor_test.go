@@ -372,3 +372,54 @@ func TestProcessPod(t *testing.T) {
 		assert.Empty(t, ta.received)
 	})
 }
+
+func TestIsBareDigest(t *testing.T) {
+	digest := "sha256:7c3a6a8f5c2e1d0b9a8f7e6d5c4b3a2918273645546372819a0b1c2d3e4f5a6b"
+	tests := []struct {
+		imageID  string
+		expected bool
+	}{
+		{imageID: digest, expected: true},
+		{imageID: "registry.k8s.io/coredns/coredns@" + digest, expected: false},
+		{imageID: "coredns@" + digest, expected: false},
+		{imageID: "docker.io/library/alpine:3.20", expected: false},
+		{imageID: "sha256:abc", expected: false},
+		{imageID: "", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.imageID, func(t *testing.T) {
+			assert.Equal(t, tt.expected, isBareDigest(tt.imageID))
+		})
+	}
+}
+
+func TestBareDigestImagesAreSkipped(t *testing.T) {
+	internal.OperatorConfig = &internal.Config{}
+	bare := "sha256:7c3a6a8f5c2e1d0b9a8f7e6d5c4b3a2918273645546372819a0b1c2d3e4f5a6b"
+
+	pod := libk8s.PodInfo{
+		PodName:      "coredns-0",
+		PodNamespace: "kube-system",
+		Containers: []*libk8s.ContainerInfo{
+			container("coredns", bare),
+			container("sidecar", "envoy@sha256:1"),
+		},
+	}
+
+	gen := &fakeGenerator{}
+	p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{&fakeTarget{}}, imageMap: map[string]bool{}}
+
+	processed, err := p.processPod(pod)
+	assert.NoError(t, err, "a bare digest isn't a failure, so it isn't retried")
+	assert.Equal(t, []string{"sidecar"}, containerNames(processed), "and isn't annotated")
+	assert.Equal(t, []string{"envoy@sha256:1"}, gen.scanned)
+
+	_, err = p.processPod(pod)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]bool{bare: true}, p.bareDigestsWarned)
+
+	onlyBare := libk8s.PodInfo{PodName: "coredns-1", PodNamespace: "kube-system", Containers: []*libk8s.ContainerInfo{container("coredns", bare)}}
+	missing, _ := p.findPodsToScan([]libk8s.PodInfo{onlyBare}, [][]*liboci.RegistryImage{images()})
+	assert.Empty(t, missing, "a bare digest alone doesn't make a pod need analysis")
+}

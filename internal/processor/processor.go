@@ -22,6 +22,7 @@ import (
 	"github.com/ckotzbauer/sbom-operator/internal/target/dtrack"
 	"github.com/ckotzbauer/sbom-operator/internal/target/git"
 	targetoci "github.com/ckotzbauer/sbom-operator/internal/target/oci"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -40,6 +41,7 @@ type Processor struct {
 	sy                sbomGenerator
 	Targets           []target.Target
 	imageMap          map[string]bool
+	bareDigestsWarned map[string]bool
 	allowedNamespaces map[string]bool
 	namespaceMutex    sync.RWMutex
 
@@ -243,6 +245,10 @@ func (p *Processor) processPod(pod libk8s.PodInfo) ([]*libk8s.ContainerInfo, err
 			logrus.Debugf("Skip image %s", container.Image.ImageID)
 			continue
 		}
+		if isBareDigest(container.Image.ImageID) {
+			p.warnBareDigest(pod, container)
+			continue
+		}
 		if _, ok := containersByImage[container.Image.ImageID]; !ok {
 			imageIDs = append(imageIDs, container.Image.ImageID)
 		}
@@ -262,6 +268,31 @@ func (p *Processor) processPod(pod libk8s.PodInfo) ([]*libk8s.ContainerInfo, err
 	}
 
 	return processed, errors.Join(errs...)
+}
+
+// isBareDigest reports whether the image ID is only a digest, without a
+// repository. The runtime reports that for images it didn't pull from a
+// registry (e.g. imported with 'ctr import', as kubespray's download_run_once
+// does); the digest is then the image's config digest, which can't be fetched
+// from any registry.
+func isBareDigest(imageID string) bool {
+	_, err := v1.NewHash(imageID)
+	return err == nil
+}
+
+// warnBareDigest logs, once per image, that a bare-digest image is skipped.
+func (p *Processor) warnBareDigest(pod libk8s.PodInfo, container *libk8s.ContainerInfo) {
+	if p.bareDigestsWarned == nil {
+		p.bareDigestsWarned = make(map[string]bool)
+	}
+	if p.bareDigestsWarned[container.Image.ImageID] {
+		return
+	}
+
+	p.bareDigestsWarned[container.Image.ImageID] = true
+	logrus.Warnf("Skipping image %s (%s) of container %s in pod %s/%s: the container runtime reports only a digest without a repository, "+
+		"so the image can't be fetched from a registry. This happens for images that were imported rather than pulled. Logged once per image.",
+		container.Image.ImageID, container.Image.Image, container.Name, pod.PodNamespace, pod.PodName)
 }
 
 // processImage sends the SBOMs for an image to all targets, unless that
@@ -502,7 +533,7 @@ func (p *Processor) findPodsToScan(pods []libk8s.PodInfo, targetImages [][]*libo
 				allImages = append(allImages, c.Image)
 			}
 
-			if needsAnalysis || p.K8s.HasAnnotation(info.Annotations, c) {
+			if needsAnalysis || isBareDigest(c.Image.ImageID) || p.K8s.HasAnnotation(info.Annotations, c) {
 				continue
 			}
 
