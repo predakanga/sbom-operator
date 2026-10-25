@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -280,7 +281,7 @@ func (g *DependencyTrackTarget) ProcessSbom(ctx *target.TargetContext) error {
 	project, skipUpload := dtrack.Project{}, false
 	if g.manageProjectActiveStatus {
 		existing, lookupErr := client.Project.Lookup(context.Background(), projectName, version)
-		if lookupErr == nil && !existing.Active && getRawImageId(existing.Tags) == ctx.Image.ImageID {
+		if lookupErr == nil && !existing.Active && slices.Contains(getRawImageIds(existing.Tags), ctx.Image.ImageID) {
 			project = existing
 			skipUpload = true
 			logrus.Infof("Reactivating existing project %s:%s without re-uploading SBOM", projectName, version)
@@ -343,14 +344,12 @@ func (g *DependencyTrackTarget) ProcessSbom(ctx *target.TargetContext) error {
 		project.Tags = append(project.Tags, dtrack.Tag{Name: sbomOperator})
 	}
 
-	// Ensure the raw-image-id tag reflects the current container digest. Previously
-	// `containsTag(project.Tags, rawImageId)` was a prefix match, so any
-	// `raw-image-id=...` tag prevented the new one from being added. When the same
-	// (projectName, version) pair was backed by different digests (mutable `:latest`,
-	// re-pushed tag, multiple pods), DT kept the first digest forever. During cleanup
-	// this caused `LoadImages()` to emit a stale digest and `Remove()` to operate on
-	// the still-live project, deleting it.
-	project.Tags = rotateRawImageIdTag(project.Tags, ctx.Image.ImageID)
+	// Record the container's digest. The same (projectName, version) can be backed
+	// by several digests at once (mutable `:latest`, a re-pushed tag pulled at
+	// different times by different pods), so the project keeps one raw-image-id
+	// tag per digest. Remove()/Deactivate() drop a digest's tag once no pod runs
+	// it, and only touch the project itself when no digest is left.
+	project.Tags = addRawImageIdTag(project.Tags, ctx.Image.ImageID)
 	podNamespaceTag := podNamespaceTagKey + "=" + ctx.Pod.PodNamespace
 	if !containsTag(project.Tags, podNamespaceTag) {
 		project.Tags = append(project.Tags, dtrack.Tag{Name: podNamespaceTag})
@@ -461,12 +460,9 @@ func (g *DependencyTrackTarget) LoadImages() ([]*libk8s.RegistryImage, error) {
 			return nil, err
 		}
 
-		var imageId string
-
 		for _, project := range projectsPage.Items {
 			sbomOperatorPropFound := false
 			imageRelatesToCluster := false
-			imageId = ""
 
 			//extend lookup logic to support `prefix` mode to resolve image association
 			if g.k8sClusterIdMode == "prefix" {
@@ -483,10 +479,6 @@ func (g *DependencyTrackTarget) LoadImages() ([]*libk8s.RegistryImage, error) {
 				if tag.Name == sbomOperator {
 					sbomOperatorPropFound = true
 				}
-
-				if strings.Index(tag.Name, rawImageId) == 0 {
-					imageId = string(tag.Name[len(rawImageId)+1:])
-				}
 			}
 
 			// When active-status management is enabled, inactive projects are not
@@ -496,9 +488,11 @@ func (g *DependencyTrackTarget) LoadImages() ([]*libk8s.RegistryImage, error) {
 				continue
 			}
 
-			if imageRelatesToCluster && sbomOperatorPropFound && len(imageId) > 0 {
-				images = append(images, &libk8s.RegistryImage{ImageID: imageId})
-				g.imageProjectMap[imageId] = project.UUID
+			if imageRelatesToCluster && sbomOperatorPropFound {
+				for _, imageId := range getRawImageIds(project.Tags) {
+					images = append(images, &libk8s.RegistryImage{ImageID: imageId})
+					g.imageProjectMap[imageId] = project.UUID
+				}
 			}
 		}
 
@@ -527,14 +521,8 @@ func (g *DependencyTrackTarget) Remove(images []*libk8s.RegistryImage) error {
 		return err
 	}
 
-	for _, img := range images {
-		uuid := g.imageProjectMap[img.ImageID]
-		if uuid.String() == "00000000-0000-0000-0000-000000000000" {
-			logrus.Warnf("No project found for imageID: %s", img.ImageID)
-			continue
-		}
-
-		project, err := client.Project.Get(context.Background(), uuid)
+	for _, orphans := range g.groupByProject(images) {
+		project, err := client.Project.Get(context.Background(), orphans.uuid)
 		if err != nil {
 			logrus.Errorf("Could not load project: %v", err)
 			continue
@@ -554,11 +542,15 @@ func (g *DependencyTrackTarget) Remove(images []*libk8s.RegistryImage) error {
 			continue
 		}
 
+		if g.removeOrphanedDigests(client, &project, orphans.imageIDs) {
+			continue
+		}
+
 		if g.k8sClusterIdMode != "tag" {
 			// Prefix mode: dt-projects are cluster-specific by name. These are safe to be deleted.
 			logrus.Infof("Image not running in any cluster - removing %v", currentImageName)
 			err := client.Project.Delete(context.Background(), project.UUID)
-			delete(g.imageProjectMap, img.ImageID)
+			g.forgetImages(orphans.imageIDs)
 			if err != nil {
 				logrus.WithError(err).Warnf("Project %s could not be deleted", project.UUID.String())
 			}
@@ -573,7 +565,7 @@ func (g *DependencyTrackTarget) Remove(images []*libk8s.RegistryImage) error {
 					logrus.Infof("Removing %v=%v tag from project %v", kubernetesCluster, g.k8sClusterId, currentImageName)
 					project.Tags = removeTag(project.Tags, kubernetesCluster+"="+g.k8sClusterId)
 					_, err := client.Project.Update(context.Background(), project)
-					delete(g.imageProjectMap, img.ImageID)
+					g.forgetImages(orphans.imageIDs)
 					if err != nil {
 						logrus.WithError(err).Warnf("Project %s could not be updated", project.UUID.String())
 					}
@@ -587,7 +579,7 @@ func (g *DependencyTrackTarget) Remove(images []*libk8s.RegistryImage) error {
 		if len(otherClusterIds) == 0 {
 			logrus.Infof("Image not running in any cluster - removing %v", currentImageName)
 			err := client.Project.Delete(context.Background(), project.UUID)
-			delete(g.imageProjectMap, img.ImageID)
+			g.forgetImages(orphans.imageIDs)
 			if err != nil {
 				logrus.WithError(err).Warnf("Project %s could not be deleted", project.UUID.String())
 			}
@@ -595,6 +587,86 @@ func (g *DependencyTrackTarget) Remove(images []*libk8s.RegistryImage) error {
 	}
 
 	return nil
+}
+
+// projectOrphans are the orphaned digests recorded by one project.
+type projectOrphans struct {
+	uuid     uuid.UUID
+	imageIDs []string
+}
+
+// groupByProject groups images by the project that records them, in order.
+// Images without a known project are skipped.
+func (g *DependencyTrackTarget) groupByProject(images []*libk8s.RegistryImage) []*projectOrphans {
+	groups := make([]*projectOrphans, 0, len(images))
+	byUUID := make(map[uuid.UUID]*projectOrphans)
+	for _, img := range images {
+		projectUUID, ok := g.imageProjectMap[img.ImageID]
+		if !ok || projectUUID == uuid.Nil {
+			logrus.Warnf("No project found for imageID: %s", img.ImageID)
+			continue
+		}
+
+		group, ok := byUUID[projectUUID]
+		if !ok {
+			group = &projectOrphans{uuid: projectUUID}
+			byUUID[projectUUID] = group
+			groups = append(groups, group)
+		}
+		group.imageIDs = append(group.imageIDs, img.ImageID)
+	}
+
+	return groups
+}
+
+func (g *DependencyTrackTarget) forgetImages(imageIDs []string) {
+	for _, id := range imageIDs {
+		delete(g.imageProjectMap, id)
+	}
+}
+
+// removeOrphanedDigests handles a project that records digests besides the
+// orphaned ones, i.e. one that is still in use: only the orphaned digests'
+// raw-image-id tags are removed, the project is kept. It reports whether it
+// handled the project; if not, no recorded digest is in use anymore.
+//
+// In tag mode, a project that other clusters use keeps all its digest tags:
+// the digests that aren't running here may be running there.
+func (g *DependencyTrackTarget) removeOrphanedDigests(client *dtrack.Client, project *dtrack.Project, orphanedIDs []string) bool {
+	remaining := slices.DeleteFunc(getRawImageIds(project.Tags), func(id string) bool {
+		return slices.Contains(orphanedIDs, id)
+	})
+	if len(remaining) == 0 {
+		return false
+	}
+
+	g.forgetImages(orphanedIDs)
+	if g.k8sClusterIdMode == "tag" && len(g.otherClusterIds(project.Tags)) > 0 {
+		logrus.Debugf("Project '%s:%s' is used by other clusters, keeping the tags of digests %v", project.Name, project.Version, orphanedIDs)
+		return true
+	}
+
+	logrus.Infof("Digests %v of project '%s:%s' aren't running anymore, removing their %s tags", orphanedIDs, project.Name, project.Version, rawImageId)
+	project.Tags = removeRawImageIdTags(project.Tags, orphanedIDs)
+	if _, err := client.Project.Update(context.Background(), *project); err != nil {
+		logrus.WithError(err).Warnf("Project tags could not be updated for project '%s:%s'", project.Name, project.Version)
+	}
+
+	return true
+}
+
+// otherClusterIds returns the IDs of the clusters other than this one that
+// tag the project.
+func (g *DependencyTrackTarget) otherClusterIds(tags []dtrack.Tag) []string {
+	ids := make([]string, 0)
+	for _, tag := range tags {
+		if strings.HasPrefix(tag.Name, kubernetesCluster+"=") {
+			if clusterId := strings.TrimPrefix(tag.Name, kubernetesCluster+"="); clusterId != g.k8sClusterId {
+				ids = append(ids, clusterId)
+			}
+		}
+	}
+	return ids
 }
 
 // Deactivate sets the given projects as inactive (and not latest) instead of
@@ -614,16 +686,18 @@ func (g *DependencyTrackTarget) Deactivate(images []*libk8s.RegistryImage) error
 		return err
 	}
 
-	for _, img := range images {
-		uuid := g.imageProjectMap[img.ImageID]
-		if uuid.String() == "00000000-0000-0000-0000-000000000000" {
-			logrus.Warnf("No project found for imageID: %s", img.ImageID)
+	for _, orphans := range g.groupByProject(images) {
+		project, err := client.Project.Get(context.Background(), orphans.uuid)
+		if err != nil {
+			logrus.Errorf("Could not load project: %v", err)
 			continue
 		}
 
-		project, err := client.Project.Get(context.Background(), uuid)
-		if err != nil {
-			logrus.Errorf("Could not load project: %v", err)
+		if !project.Active || !slices.ContainsFunc(project.Tags, func(t dtrack.Tag) bool { return t.Name == sbomOperator }) {
+			continue
+		}
+
+		if g.removeOrphanedDigests(client, &project, orphans.imageIDs) {
 			continue
 		}
 
@@ -707,31 +781,40 @@ func removeTag(tags []dtrack.Tag, tagString string) []dtrack.Tag {
 	return newTags
 }
 
-// getRawImageId returns the value of the first `raw-image-id=<id>` tag, or an
-// empty string if none is present.
-func getRawImageId(tags []dtrack.Tag) string {
+// getRawImageIds returns the values of all `raw-image-id=<id>` tags.
+func getRawImageIds(tags []dtrack.Tag) []string {
 	prefix := rawImageId + "="
+	ids := make([]string, 0, 1)
 	for _, tag := range tags {
 		if strings.HasPrefix(tag.Name, prefix) {
-			return strings.TrimPrefix(tag.Name, prefix)
+			ids = append(ids, strings.TrimPrefix(tag.Name, prefix))
 		}
 	}
-	return ""
+	return ids
 }
 
-// rotateRawImageIdTag drops any existing `raw-image-id=*` tag(s) from the slice
-// and appends a single `raw-image-id=<digest>` tag with the current digest. Used
-// to keep the project's recorded digest in sync with the container that the
-// operator just processed. See ProcessSbom for the rationale.
-func rotateRawImageIdTag(tags []dtrack.Tag, currentImageID string) []dtrack.Tag {
-	prefix := rawImageId + "="
-	out := make([]dtrack.Tag, 0, len(tags)+1)
+// addRawImageIdTag appends a `raw-image-id=<digest>` tag, unless the project
+// already records that digest. See ProcessSbom for the rationale.
+func addRawImageIdTag(tags []dtrack.Tag, imageID string) []dtrack.Tag {
+	name := rawImageId + "=" + imageID
 	for _, tag := range tags {
-		if !strings.HasPrefix(tag.Name, prefix) {
+		if tag.Name == name {
+			return tags
+		}
+	}
+	return append(tags, dtrack.Tag{Name: name})
+}
+
+// removeRawImageIdTags drops the `raw-image-id=<digest>` tags of the given
+// digests.
+func removeRawImageIdTags(tags []dtrack.Tag, imageIDs []string) []dtrack.Tag {
+	out := make([]dtrack.Tag, 0, len(tags))
+	for _, tag := range tags {
+		if !strings.HasPrefix(tag.Name, rawImageId+"=") || !slices.Contains(imageIDs, strings.TrimPrefix(tag.Name, rawImageId+"=")) {
 			out = append(out, tag)
 		}
 	}
-	return append(out, dtrack.Tag{Name: prefix + currentImageID})
+	return out
 }
 
 func getRepoWithVersion(image *libk8s.RegistryImage, useShortName bool, k8sClusterId string, k8sClusterIdMode string, scope string) (string, string) {

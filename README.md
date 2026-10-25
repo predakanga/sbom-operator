@@ -213,6 +213,9 @@ not present in the cluster anymore are removed from the configured targets (exce
 
 Each image in the cluster is created as project with the full-image name (registry and image-path without tag) and the image-tag as project-version.
 When there's no image-tag, but a digest, the digest is used as project-version.
+If pods run different digests of the same tag (e.g. a re-pushed tag pulled at different times), the project records each digest
+in its own `raw-image-id=<image-id>` tag. A digest's tag is removed once no pod runs it, and the project is only removed (or deactivated)
+along with its last digest. With `kubernetes-cluster-id-mode=tag`, a project that other clusters also use keeps all its digest tags.
 The `autoCreate` option of DT is used. You have to set the `--format` flag to `cyclonedx` with this target.
 
 > [!IMPORTANT]
