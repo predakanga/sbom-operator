@@ -18,21 +18,31 @@ func TestMapPredicateTypeToMediaType(t *testing.T) {
 		{
 			name:          "CycloneDX Predicate",
 			predicateType: "https://cyclonedx.org/bom/v1.4",
-			expected:      GetMediaType(CycloneDXJSONMediaType),
+			expected:      CycloneDXJSONMediaType,
+		},
+		{
+			name:          "CycloneDX Predicate without version",
+			predicateType: "https://cyclonedx.org/bom",
+			expected:      CycloneDXJSONMediaType,
 		},
 		{
 			name:          "SPDX Predicate",
 			predicateType: "https://spdx.dev/Document",
-			expected:      GetMediaType(SPDXJSONMediaType),
+			expected:      SPDXJSONMediaType,
 		},
 		{
 			name:          "Syft Predicate",
 			predicateType: "https://syft.anchore.com/document/v1",
-			expected:      GetMediaType(SyftMediaType),
+			expected:      SyftMediaType,
 		},
 		{
 			name:          "Unknown Predicate",
 			predicateType: "https://unknown.org/schema",
+			expected:      "",
+		},
+		{
+			name:          "Empty Predicate",
+			predicateType: "",
 			expected:      "",
 		},
 	}
@@ -63,7 +73,7 @@ func TestExtractFromDsseEnvelope(t *testing.T) {
 	t.Run("Valid DSSE Envelope Extraction", func(t *testing.T) {
 		sbom, mt, ok := extractFromDsseEnvelope(envBytes)
 		assert.True(t, ok)
-		assert.Equal(t, GetMediaType(CycloneDXJSONMediaType), mt)
+		assert.Equal(t, types.MediaType(CycloneDXJSONMediaType), mt)
 		assert.Contains(t, sbom, "CycloneDX")
 	})
 
@@ -80,8 +90,23 @@ func TestExtractFromDsseEnvelope(t *testing.T) {
 }
 
 func TestIsSupportedSbomMediaType(t *testing.T) {
-	assert.True(t, isSupportedSbomMediaType(GetMediaType(CycloneDXJSONMediaType)))
-	assert.True(t, isSupportedSbomMediaType(GetMediaType(SPDXJSONMediaType)))
-	assert.True(t, isSupportedSbomMediaType(GetMediaType(SyftMediaType)))
-	assert.False(t, isSupportedSbomMediaType("application/octet-stream"))
+	tests := []struct {
+		mediaType types.MediaType
+		expected  bool
+	}{
+		{mediaType: CycloneDXJSONMediaType, expected: true},
+		{mediaType: CycloneDXXMLMediaType, expected: true},
+		{mediaType: SPDXJSONMediaType, expected: true},
+		{mediaType: SPDXMediaType, expected: true},
+		{mediaType: SyftMediaType, expected: true},
+		{mediaType: MediaTypeDsseEnvelope, expected: false},
+		{mediaType: "application/octet-stream", expected: false},
+		{mediaType: "", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.mediaType), func(t *testing.T) {
+			assert.Equal(t, tt.expected, isSupportedSbomMediaType(tt.mediaType))
+		})
+	}
 }

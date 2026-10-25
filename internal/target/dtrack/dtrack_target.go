@@ -208,7 +208,7 @@ func (g *DependencyTrackTarget) identifiyParentProjectUuid(ctx *target.TargetCon
 }
 
 func (g *DependencyTrackTarget) ProcessSbom(ctx *target.TargetContext) error {
-	if ctx.MediaType != "" && ctx.MediaType != oci.CycloneDXJSONMediaType && ctx.MediaType != oci.CycloneDXXMLMediaType {
+	if !g.AcceptsMediaType(ctx.MediaType) {
 		logrus.Warnf("Skipping attestation SBOM (scope=%s) with unsupported mediaType %s for Dependency-Track", ctx.Scope, ctx.MediaType)
 		return nil
 	}
@@ -332,6 +332,13 @@ func (g *DependencyTrackTarget) ProcessSbom(ctx *target.TargetContext) error {
 
 	g.imageProjectMap[ctx.Image.ImageID] = project.UUID
 	return nil
+}
+
+// AcceptsMediaType implements target.MediaTypeFilter: Dependency-Track only
+// ingests CycloneDX. Syft-generated SBOMs (empty media type) are accepted, the
+// configured format is the user's responsibility.
+func (g *DependencyTrackTarget) AcceptsMediaType(mediaType string) bool {
+	return mediaType == "" || mediaType == oci.CycloneDXJSONMediaType || mediaType == oci.CycloneDXXMLMediaType
 }
 
 func (g *DependencyTrackTarget) getContainerNameAndVersion(podAnnotationKey string, podAnnotationValue string, expectedAnnotationKey string, ctx *target.TargetContext) (string, string, error) {

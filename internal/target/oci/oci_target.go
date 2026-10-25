@@ -10,6 +10,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/sirupsen/logrus"
 )
 
@@ -78,6 +79,10 @@ func (g *OciTarget) ProcessSbom(ctx *target.TargetContext) error {
 	}
 
 	sbomType := oci.GetMediaType(g.sbomFormat)
+	if ctx.MediaType != "" {
+		// attestation SBOMs keep their own format
+		sbomType = types.MediaType(ctx.MediaType)
+	}
 	logrus.Debugf("Uploading SBOM file for [%s] to [%s] with mediaType [%s]", ref.Name(), dstRef.Name(), sbomType)
 	img, err := oci.CreateImage(b, sbomType)
 	if err != nil {
