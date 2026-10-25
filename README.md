@@ -451,6 +451,17 @@ COSIGN_REPOSITORY=ghcr.io/ckotzbauer/sbom-operator-metadata cosign download atte
 COSIGN_REPOSITORY=ghcr.io/ckotzbauer/sbom-operator-metadata cosign download sbom ghcr.io/ckotzbauer/sbom-operator:<tag-to-verify> | jq -r '.payload' | base64 -d
 ```
 
+### Fork images
+
+Images of this fork (`ghcr.io/predakanga/sbom-operator`) are signed with the key pair whose public key is [`cosign.pub`](cosign.pub).
+Signatures and attestations are stored next to the image, and SPDX (`spdxjson`) and CycloneDX (`cyclonedx`) SBOMs are attached as attestations.
+
+```bash
+cosign verify --key cosign.pub ghcr.io/predakanga/sbom-operator:<tag-to-verify>
+cosign verify-attestation --key cosign.pub --type spdxjson ghcr.io/predakanga/sbom-operator:<tag-to-verify>
+cosign verify-attestation --key cosign.pub --type cyclonedx ghcr.io/predakanga/sbom-operator:<tag-to-verify>
+```
+
 
 [License](https://github.com/ckotzbauer/sbom-operator/blob/master/LICENSE)
 --------
