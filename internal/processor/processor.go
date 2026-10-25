@@ -2,6 +2,8 @@ package processor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"sync"
@@ -27,9 +29,14 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 )
 
+// sbomGenerator creates an SBOM for an image (implemented by syft.Syft).
+type sbomGenerator interface {
+	ExecuteSyft(img *liboci.RegistryImage) (string, error)
+}
+
 type Processor struct {
 	K8s               *kubernetes.KubeClient
-	sy                *syft.Syft
+	sy                sbomGenerator
 	Targets           []target.Target
 	imageMap          map[string]bool
 	allowedNamespaces map[string]bool
@@ -126,7 +133,7 @@ func (p *Processor) ListenForPods() {
 
 			var removedContainers []*libk8s.ContainerInfo
 			newInfo.Containers, removedContainers = getChangedContainers(oldInfo, newInfo)
-			p.scanPod(newInfo)
+			_ = p.scanPod(newInfo) // errors are logged
 			p.cleanupImagesIfNeeded(removedContainers, informer.GetStore().List())
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -198,60 +205,94 @@ func (p *Processor) ProcessAllPods(pods []libk8s.PodInfo, allImages []*liboci.Re
 	}
 }
 
-func (p *Processor) scanPod(pod libk8s.PodInfo) {
-	errOccurred := false
+// scanPod processes the pod's containers which aren't annotated as processed
+// yet, and annotates those that succeeded. It returns an error if any failed.
+func (p *Processor) scanPod(pod libk8s.PodInfo) error {
+	processed, err := p.processPod(pod)
+	p.K8s.UpdatePodAnnotation(pod, processed)
+	return err
+}
+
+// processPod sends SBOMs for the images of the pod's unannotated containers to
+// all targets. It returns the containers whose image succeeded, and an error
+// if any image failed.
+func (p *Processor) processPod(pod libk8s.PodInfo) ([]*libk8s.ContainerInfo, error) {
 	p.K8s.InjectPullSecrets(pod)
-	containerNames := make(map[string][]*libk8s.ContainerInfo)
+	imageIDs := make([]string, 0)
+	containersByImage := make(map[string][]*libk8s.ContainerInfo)
 	for _, container := range pod.Containers {
 		if p.K8s.HasAnnotation(pod.Annotations, container) {
 			logrus.Debugf("Skip image %s", container.Image.ImageID)
 			continue
 		}
-		containerNames[container.Image.ImageID] = append(containerNames[container.Image.ImageID], container)
+		if _, ok := containersByImage[container.Image.ImageID]; !ok {
+			imageIDs = append(imageIDs, container.Image.ImageID)
+		}
+		containersByImage[container.Image.ImageID] = append(containersByImage[container.Image.ImageID], container)
 	}
-	for imageId, containerList := range containerNames {
-		var attContexts []*target.TargetContext
-		var syftContext *target.TargetContext
-		for _, container := range containerList {
-			logrus.Tracef("Scanning container '%s'", container.Name)
-			alreadyScanned := p.imageMap[container.Image.ImageID]
 
-			if !alreadyScanned {
-				p.imageMap[container.Image.ImageID] = true
+	processed := make([]*libk8s.ContainerInfo, 0)
+	var errs []error
+	for _, imageID := range imageIDs {
+		containers := containersByImage[imageID]
+		if err := p.processImage(&pod, imageID, containers); err != nil {
+			logrus.WithError(err).Errorf("Failed to process image %s of pod %s/%s", imageID, pod.PodNamespace, pod.PodName)
+			errs = append(errs, err)
+			continue
+		}
+		processed = append(processed, containers...)
+	}
 
-				if internal.OperatorConfig.FetchOciAttestations {
-					attSboms, attErr := oci.FetchSbomAttestations(context.Background(), container.Image, libstandard.ToMap(internal.OperatorConfig.RegistryProxies))
-					if attErr != nil {
-						logrus.WithError(attErr).Warnf("Could not fetch OCI attestations for image %s", imageId)
-					} else {
-						for _, att := range attSboms {
-							attContexts = append(attContexts, target.NewContext(att.Sbom, container.Image, &pod).
-								WithAttestation(att.Scope, string(att.MediaType)))
-						}
-					}
-				}
-				if needsSyftSbom(p.Targets, attContexts) {
-					// Execute syft only if some target can't use any of the default-scope SBOMs attached in OCI
-					sbom, err := p.sy.ExecuteSyft(container.Image)
-					if err != nil {
-						continue // Error is already handled from syft module.
-					}
-					syftContext = target.NewContext(sbom, container.Image, &pod)
-				}
+	return processed, errors.Join(errs...)
+}
+
+// processImage sends the SBOMs for an image to all targets, unless that
+// already succeeded for another pod. The image is only recorded as processed
+// once every target accepted its SBOMs, so failures are retried.
+func (p *Processor) processImage(pod *libk8s.PodInfo, imageID string, containers []*libk8s.ContainerInfo) error {
+	if p.imageMap[imageID] {
+		logrus.Debugf("Image %s was already processed", imageID)
+		return nil
+	}
+
+	image := containers[0].Image
+	var attContexts []*target.TargetContext
+	if internal.OperatorConfig.FetchOciAttestations {
+		attSboms, attErr := oci.FetchSbomAttestations(context.Background(), image, libstandard.ToMap(internal.OperatorConfig.RegistryProxies))
+		if attErr != nil {
+			logrus.WithError(attErr).Warnf("Could not fetch OCI attestations for image %s", imageID)
+		} else {
+			for _, att := range attSboms {
+				attContexts = append(attContexts, target.NewContext(att.Sbom, image, pod).
+					WithAttestation(att.Scope, string(att.MediaType)))
 			}
 		}
-		for _, t := range p.Targets {
-			for _, ctx := range sbomsForTarget(t, attContexts, syftContext) {
-				err := t.ProcessSbom(ctx.WithContainers(containerList))
-				errOccurred = errOccurred || err != nil
+	}
+
+	var syftContext *target.TargetContext
+	if needsSyftSbom(p.Targets, attContexts) {
+		// Execute syft only if some target can't use any of the default-scope SBOMs attached in OCI
+		sbom, err := p.sy.ExecuteSyft(image)
+		if err != nil {
+			return fmt.Errorf("syft failed: %w", err)
+		}
+		syftContext = target.NewContext(sbom, image, pod)
+	}
+
+	var errs []error
+	for _, t := range p.Targets {
+		for _, ctx := range sbomsForTarget(t, attContexts, syftContext) {
+			if err := t.ProcessSbom(ctx.WithContainers(containers)); err != nil {
+				errs = append(errs, err)
 			}
 		}
-
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("target failed: %w", errors.Join(errs...))
 	}
 
-	if !errOccurred && len(pod.Containers) > 0 {
-		p.K8s.UpdatePodAnnotation(pod)
-	}
+	p.imageMap[imageID] = true
+	return nil
 }
 
 // hasDefaultScopeSbom reports whether one of the attestation SBOMs is a
@@ -371,7 +412,7 @@ func HasJobImage() bool {
 
 func (p *Processor) executeSyftScans(pods []libk8s.PodInfo, allImages []*liboci.RegistryImage) {
 	for _, pod := range pods {
-		p.scanPod(pod)
+		_ = p.scanPod(pod) // errors are logged, failed images are retried on the next run
 	}
 
 	for _, t := range p.Targets {
@@ -477,7 +518,7 @@ func (p *Processor) executeJobImage(pods []libk8s.PodInfo) {
 
 	if jobClient.WaitForJob(j) {
 		for _, pod := range filteredPods {
-			p.K8s.UpdatePodAnnotation(pod)
+			p.K8s.UpdatePodAnnotation(pod, pod.Containers)
 		}
 	}
 }
