@@ -1066,3 +1066,83 @@ func TestDeactivateSiblingVersions_TagMode_MultiCluster(t *testing.T) {
 	// Szenario 3 (siblingOwnClusterOnlyUUID): Deaktiviert per PATCH (und Szenario 1 wurde komplett ignoriert)
 	assert.Equal(t, []string{siblingOwnClusterOnlyUUID.String()}, patchedUUIDs)
 }
+
+// When an upload times out, Dependency-Track usually imports the BOM anyway.
+// The project must still get our tags (so LoadImages recognises it and it can
+// be cleaned up), but the upload is reported as failed so it's retried.
+func TestProcessSbomTagsProjectAfterUploadTimeout(t *testing.T) {
+	projectUUID := "11111111-2222-3333-4444-555555555555"
+
+	tests := []struct {
+		name          string
+		bomStatus     int
+		projectExists bool
+		expectTimeout bool
+		expectLookup  bool
+		expectUpdate  bool
+	}{
+		{name: "project created despite timeout", projectExists: true, expectTimeout: true, expectLookup: true, expectUpdate: true},
+		{name: "project not created (yet)", projectExists: false, expectTimeout: true, expectLookup: true, expectUpdate: false},
+		{name: "other upload errors aren't treated as timeouts", bomStatus: http.StatusInternalServerError, projectExists: true, expectTimeout: false, expectLookup: false, expectUpdate: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			release := make(chan struct{})
+			lookedUp := false
+			var updatedTags []string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.URL.Path == "/api/v1/bom":
+					if tt.bomStatus != 0 {
+						w.WriteHeader(tt.bomStatus)
+						return
+					}
+					<-release
+				case r.URL.Path == "/api/v1/project/lookup":
+					lookedUp = true
+					if !tt.projectExists {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					_, _ = w.Write([]byte(`{"name": "library/alpine", "version": "3.14", "uuid": "` + projectUUID + `", "tags": []}`))
+				case r.URL.Path == "/api/v1/project" && r.Method == http.MethodPost:
+					var p dtrack.Project
+					_ = json.NewDecoder(r.Body).Decode(&p)
+					for _, tag := range p.Tags {
+						updatedTags = append(updatedTags, tag.Name)
+					}
+					_, _ = w.Write([]byte(`{}`))
+				default:
+					_, _ = w.Write([]byte(`{"totalCount": 0}`))
+				}
+			}))
+			defer ts.Close()
+			defer close(release)
+
+			g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", true, false, "300ms")
+			require.NoError(t, g.ValidateConfig())
+			require.NoError(t, g.Initialize())
+			g.imageProjectMap = map[string]uuid.UUID{}
+
+			ctx := &target.TargetContext{
+				Image:      &liboci.RegistryImage{ImageID: "alpine@sha256:aaa", Image: "alpine:3.14"},
+				Pod:        &libk8s_real.PodInfo{PodNamespace: "default"},
+				Containers: []*libk8s_real.ContainerInfo{{Name: "alpine"}},
+				Sbom:       "{}",
+			}
+
+			err := g.ProcessSbom(ctx)
+			require.Error(t, err, "the upload is retried in every case")
+			assert.Equal(t, tt.expectTimeout, isTimeout(err))
+			assert.Equal(t, tt.expectLookup, lookedUp)
+			if tt.expectUpdate {
+				assert.ElementsMatch(t, []string{"kubernetes-cluster=my-cluster", "sbom-operator", "raw-image-id=alpine@sha256:aaa", "namespace=default"}, updatedTags)
+				assert.Equal(t, projectUUID, g.imageProjectMap["alpine@sha256:aaa"].String())
+			} else {
+				assert.Empty(t, updatedTags)
+			}
+		})
+	}
+}

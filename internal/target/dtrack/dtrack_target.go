@@ -2,7 +2,9 @@ package dtrack
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -286,6 +288,9 @@ func (g *DependencyTrackTarget) ProcessSbom(ctx *target.TargetContext) error {
 	}
 
 	parentUuid := g.identifiyParentProjectUuid(ctx, client)
+	// set when the upload timed out: the project is still tagged, but the
+	// upload is reported as failed so that it's retried
+	var uploadErr error
 	if !skipUpload {
 		logrus.Infof("Sending SBOM to Dependency Track (project=%s, version=%s)", projectName, version)
 		uploadToken, err := client.BOM.PostBom(
@@ -293,15 +298,28 @@ func (g *DependencyTrackTarget) ProcessSbom(ctx *target.TargetContext) error {
 			dtrack.BOMUploadRequest{ProjectName: projectName, ProjectVersion: version, ParentUUID: parentUuid, AutoCreate: true, BOM: ctx.Sbom},
 		)
 		if err != nil {
-			logrus.Errorf("Could not upload BOM: %v", err)
-			return err
+			if !isTimeout(err) {
+				logrus.Errorf("Could not upload BOM: %v", err)
+				return err
+			}
+
+			// Dependency-Track only replies once it has processed the BOM, and
+			// usually goes on to import it after we gave up. Without our tags the
+			// project would neither be recognised by LoadImages nor cleaned up.
+			logrus.Warnf("Upload of SBOM for %s:%s timed out, consider raising --%s. Tagging the project in case Dependency-Track created it anyway", projectName, version, internal.ConfigKeyDependencyTrackTimeout)
+			uploadErr = fmt.Errorf("BOM upload timed out: %w", err)
+		} else {
+			logrus.Infof("Uploaded SBOM (upload-token=%s)", uploadToken)
 		}
-		logrus.Infof("Uploaded SBOM (upload-token=%s)", uploadToken)
 	}
 
 	if !skipUpload {
 		project, err = client.Project.Lookup(context.Background(), projectName, version)
 		if err != nil {
+			if uploadErr != nil {
+				logrus.Warnf("Project %s:%s doesn't exist (yet) after the timed out upload", projectName, version)
+				return uploadErr
+			}
 			logrus.Errorf("Could not find project: %v", err)
 			return err
 		}
@@ -377,7 +395,17 @@ func (g *DependencyTrackTarget) ProcessSbom(ctx *target.TargetContext) error {
 	}
 
 	g.imageProjectMap[ctx.Image.ImageID] = project.UUID
-	return nil
+	return uploadErr
+}
+
+// isTimeout reports whether err is a client-side timeout.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (g *DependencyTrackTarget) getContainerNameAndVersion(podAnnotationKey string, podAnnotationValue string, expectedAnnotationKey string, ctx *target.TargetContext) (string, string, error) {
