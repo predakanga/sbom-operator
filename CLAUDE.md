@@ -87,7 +87,7 @@ sbom-git-operator/
 
 ### Two Operating Modes
 
-1. **Informer mode** (default, no `--cron`): Uses Kubernetes `SharedIndexInformer` to watch pod update/delete events in real-time. Processes new images immediately on pod changes. Also watches namespace changes when `--namespace-label-selector` is set.
+1. **Informer mode** (default, no `--cron`): Uses Kubernetes `SharedIndexInformer` to watch pod update/delete events in real-time. Event handlers only enqueue work items (`internal/processor/queue.go`): pod scans, image cleanups and the initial sync. A single worker processes them, so scans never overlap (they share stereoscope's temp dirs) and `imageMap`/target state stay on one goroutine. Failed items are retried with exponential backoff (30s up to 1h). Also watches namespace changes when `--namespace-label-selector` is set.
 
 2. **CRON/Daemon mode** (`--cron` set): Uses `robfig/cron` to run periodic full-cluster scans. Mutex-protected to prevent concurrent runs. Iterates all namespaces and pods per schedule.
 
@@ -125,7 +125,7 @@ When `--job-image` is set, the operator delegates SBOM generation to a Kubernete
 
 ### Pod Annotation Tracking
 
-After processing, pods are annotated with `ckotzbauer.sbom-operator.io/<container-name>=<imageID>` to skip already-scanned images. Annotation updates retry up to 3 times.
+After processing, pods are annotated with `ckotzbauer.sbom-operator.io/<container-name>=<imageID>` to skip already-scanned images. Only containers whose image reached every target are annotated, each with its normalised image ID (without a `docker-pullable://` prefix). An image is recorded in `imageMap` only after all targets succeeded. Annotation updates retry up to 3 times.
 
 ### Namespace Filtering
 
@@ -217,6 +217,9 @@ The `hack/run-tests.sh` script:
 | Test file                                      | What it tests                                                                                                                                              |
 | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `internal/kubernetes/image_test.go`            | Registry proxy mapping (`ApplyProxyRegistry`)                                                                                                              |
+| `internal/kubernetes/kubernetes_test.go`       | Pod annotation writing/matching, image ID normalisation                                                                                                    |
+| `internal/processor/processor_test.go`         | Initial-sync pod selection, SBOM dispatch per target media type, per-image success tracking                                                                |
+| `internal/processor/queue_test.go`             | Work queue: initial sync, retries with backoff, orphan cleanup (fake API server via `httptest`)                                                            |
 | `internal/syft/syft_test.go`                   | End-to-end SBOM generation against real images (alpine, redis, node, fedora) in JSON, CycloneDX XML, SPDX JSON formats. Uses fixture files for comparison. |
 | `internal/target/git/git_target_test.go`       | `ImageIDToFilePath` conversion logic                                                                                                                       |
 | `internal/target/oci/oci_target_test.go`       | OCI target integration test (requires `TEST_DIGEST` and `DATE` env vars)                                                                                   |

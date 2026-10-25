@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 	batchv1 "k8s.io/api/batch/v1"
@@ -150,9 +151,16 @@ func (client *KubeClient) LoadImageInfos(namespaces []corev1.Namespace, podLabel
 	return podInfos, allImages
 }
 
-func (client *KubeClient) UpdatePodAnnotation(pod libk8s.PodInfo) {
+// UpdatePodAnnotation records the given containers of pod as processed, each
+// with the image ID it was processed with. Other containers keep their
+// annotations, if any.
+func (client *KubeClient) UpdatePodAnnotation(pod libk8s.PodInfo, containers []*libk8s.ContainerInfo) {
+	if len(containers) == 0 {
+		return
+	}
+
 	for i := 0; i < updatePodMaxRetries; i++ {
-		err := client.updatePodAnnotation(pod)
+		err := client.updatePodAnnotation(pod, containers)
 		if err == nil {
 			break
 		}
@@ -161,7 +169,7 @@ func (client *KubeClient) UpdatePodAnnotation(pod libk8s.PodInfo) {
 	}
 }
 
-func (client *KubeClient) updatePodAnnotation(pod libk8s.PodInfo) error {
+func (client *KubeClient) updatePodAnnotation(pod libk8s.PodInfo, containers []*libk8s.ContainerInfo) error {
 	newPod, err := client.Client.Client.CoreV1().Pods(pod.PodNamespace).Get(context.Background(), pod.PodName, meta.GetOptions{})
 	if err != nil {
 		if !errors.IsNotFound(err) {
@@ -171,24 +179,7 @@ func (client *KubeClient) updatePodAnnotation(pod libk8s.PodInfo) error {
 		return nil
 	}
 
-	ann := newPod.Annotations
-	if ann == nil {
-		ann = make(map[string]string)
-	}
-
-	for _, c := range newPod.Status.ContainerStatuses {
-		ann[fmt.Sprintf(AnnotationTemplate, c.Name)] = c.ImageID
-	}
-
-	for _, c := range newPod.Status.InitContainerStatuses {
-		ann[fmt.Sprintf(AnnotationTemplate, c.Name)] = c.ImageID
-	}
-
-	for _, c := range newPod.Status.EphemeralContainerStatuses {
-		ann[fmt.Sprintf(AnnotationTemplate, c.Name)] = c.ImageID
-	}
-
-	newPod.Annotations = ann
+	newPod.Annotations = withContainerAnnotations(newPod.Annotations, containers)
 
 	_, err = client.Client.Client.CoreV1().Pods(newPod.Namespace).Update(context.Background(), newPod, meta.UpdateOptions{})
 	if err != nil {
@@ -198,16 +189,38 @@ func (client *KubeClient) updatePodAnnotation(pod libk8s.PodInfo) error {
 	return nil
 }
 
+// withContainerAnnotations returns annotations with an entry per container,
+// set to the container's (normalised) image ID.
+func withContainerAnnotations(annotations map[string]string, containers []*libk8s.ContainerInfo) map[string]string {
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+
+	for _, c := range containers {
+		annotations[fmt.Sprintf(AnnotationTemplate, c.Name)] = c.Image.ImageID
+	}
+
+	return annotations
+}
+
 func (client *KubeClient) HasAnnotation(annotations map[string]string, container *libk8s.ContainerInfo) bool {
 	if annotations == nil || client.ignoreAnnotations {
 		return false
 	}
 
 	if val, ok := annotations[fmt.Sprintf(AnnotationTemplate, container.Name)]; ok {
-		return val == container.Image.ImageID
+		return normaliseImageID(val) == container.Image.ImageID
 	}
 
 	return false
+}
+
+// normaliseImageID strips the runtime prefix (e.g. "docker-pullable://") from
+// an image ID, as libk8soci's ExtractPodInfos does. Older versions annotated
+// pods with the raw status value.
+func normaliseImageID(imageID string) string {
+	parts := strings.Split(imageID, "://")
+	return parts[len(parts)-1]
 }
 
 func (client *KubeClient) CreateJobSecret(namespace, suffix string, data []byte) error {

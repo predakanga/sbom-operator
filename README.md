@@ -169,6 +169,10 @@ When you omit the `cron` flag, the operator uses a Cache-Informer to process cha
 a one-time analysis at startup to sync the targets with the actual cluster-state. If you configured a job-image there's no initial
 startup sync.
 
+Images are processed one at a time. When an image can't be scanned or a target rejects its SBOM (e.g. a registry rate limit or a
+target that's down), the pod is retried with exponential backoff, from 30 seconds up to once an hour. Only containers whose
+image reached every target are annotated as processed.
+
 
 ### AWS ECR (IRSA / Pod Identity)
 

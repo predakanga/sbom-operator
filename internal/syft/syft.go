@@ -4,12 +4,10 @@ import (
 	"context"
 	"crypto"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 
+	"github.com/anchore/stereoscope"
 	"github.com/anchore/stereoscope/pkg/image"
 	"github.com/anchore/syft/syft"
 	"github.com/anchore/syft/syft/cataloging"
@@ -58,6 +56,8 @@ func (s Syft) WithSyftVersion(version string) Syft {
 	return s
 }
 
+// ExecuteSyft creates an SBOM for img. Calls must not overlap: a failed call
+// removes all of stereoscope's temp files, including those of another scan.
 func (s *Syft) ExecuteSyft(img *oci.RegistryImage) (string, error) {
 	logrus.Infof("Processing image %s", img.ImageID)
 
@@ -77,16 +77,26 @@ func (s *Syft) ExecuteSyft(img *oci.RegistryImage) (string, error) {
 
 	if err != nil {
 		logrus.WithError(fmt.Errorf("failed to construct source from input registry:%s: %w", img.ImageID, err)).Error("Source-Creation failed")
+		// Without a source there's no image whose Cleanup would remove the temp
+		// dir the registry provider already created. This removes every
+		// stereoscope temp dir, which is safe because scans never overlap.
+		stereoscope.Cleanup() //nolint:staticcheck // see above
 		return "", err
 	}
 
-	defer func() {
-		if src != nil {
+	// Close the source as soon as cataloging is done, so stereoscope's temp
+	// files (the pulled layers) are removed before the next scan starts. The
+	// deferred call covers the early returns and is a no-op afterwards.
+	closed := false
+	closeSource := func() {
+		if src != nil && !closed {
+			closed = true
 			if err := src.Close(); err != nil {
 				logrus.WithError(err).Infof("unable to close source")
 			}
 		}
-	}()
+	}
+	defer closeSource()
 
 	cfg := syft.DefaultCreateSBOMConfig().
 		WithParallelism(5).
@@ -105,6 +115,7 @@ func (s *Syft) ExecuteSyft(img *oci.RegistryImage) (string, error) {
 	}
 
 	result, err := syft.CreateSBOM(context.Background(), src, cfg)
+	closeSource()
 	if err != nil {
 		logrus.WithError(err).Error("SBOM-Creation failed")
 		return "", err
@@ -131,13 +142,7 @@ func (s *Syft) ExecuteSyft(img *oci.RegistryImage) (string, error) {
 		return "", err
 	}
 
-	bom := string(b)
-	err = removeTempContents()
-	if err != nil {
-		logrus.WithError(err).Warn("Could not cleanup tmp directory")
-	}
-
-	return bom, nil
+	return string(b), nil
 }
 
 // stripCPEs removes all CPE attributes from the SBOM's packages. CPEs are
@@ -224,30 +229,4 @@ func getSyftVersion() string {
 	}
 
 	return ""
-}
-
-func removeTempContents() error {
-	dir := "/tmp"
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer closeOrLog(d)
-	names, err := d.Readdirnames(-1)
-	if err != nil {
-		return err
-	}
-	for _, name := range names {
-		err = os.RemoveAll(filepath.Join(dir, name))
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func closeOrLog(c io.Closer) {
-	if err := c.Close(); err != nil {
-		logrus.WithError(err).Warnf("Could not close file")
-	}
 }

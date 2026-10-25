@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"errors"
 	"slices"
 	"testing"
 
@@ -56,19 +57,32 @@ func TestNamespaceLabelMatches(t *testing.T) {
 	assert.False(t, p.namespaceLabelMatches(labels3, selector))
 }
 
-// fakeTarget records the SBOMs it receives and accepts every media type.
+// fakeTarget records the SBOMs it receives and accepts every media type. It
+// fails for the image IDs in fail.
 type fakeTarget struct {
 	received []*target.TargetContext
+	fail     map[string]bool
+	images   []*liboci.RegistryImage
+	loadErr  error
+	removed  []string
 }
 
 func (f *fakeTarget) Initialize() error     { return nil }
 func (f *fakeTarget) ValidateConfig() error { return nil }
 func (f *fakeTarget) ProcessSbom(ctx *target.TargetContext) error {
+	if f.fail[ctx.Image.ImageID] {
+		return errors.New("target unavailable")
+	}
 	f.received = append(f.received, ctx)
 	return nil
 }
-func (f *fakeTarget) LoadImages() ([]*liboci.RegistryImage, error) { return nil, nil }
-func (f *fakeTarget) Remove(images []*liboci.RegistryImage) error  { return nil }
+func (f *fakeTarget) LoadImages() ([]*liboci.RegistryImage, error) { return f.images, f.loadErr }
+func (f *fakeTarget) Remove(images []*liboci.RegistryImage) error {
+	for _, i := range images {
+		f.removed = append(f.removed, i.ImageID)
+	}
+	return nil
+}
 
 // filteringTarget implements target.MediaTypeFilter.
 type filteringTarget struct {
@@ -261,4 +275,100 @@ func TestFindPodsToScan(t *testing.T) {
 			assert.Equal(t, tt.expectedImages, imageIDs)
 		})
 	}
+}
+
+// fakeGenerator returns an SBOM named after the image, and fails for the image
+// IDs in fail.
+type fakeGenerator struct {
+	scanned []string
+	fail    map[string]bool
+}
+
+func (f *fakeGenerator) ExecuteSyft(img *liboci.RegistryImage) (string, error) {
+	f.scanned = append(f.scanned, img.ImageID)
+	if f.fail[img.ImageID] {
+		return "", errors.New("TOOMANYREQUESTS")
+	}
+	return "sbom of " + img.ImageID, nil
+}
+
+func containerNames(containers []*libk8s.ContainerInfo) []string {
+	names := make([]string, 0, len(containers))
+	for _, c := range containers {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
+func TestProcessPod(t *testing.T) {
+	internal.OperatorConfig = &internal.Config{}
+
+	pod := libk8s.PodInfo{
+		PodName:      "mysql-0",
+		PodNamespace: "db",
+		Annotations:  map[string]string{"ckotzbauer.sbom-operator.io/done": "done@sha256:0"},
+		Containers: []*libk8s.ContainerInfo{
+			container("mysql", "mysql@sha256:1"),
+			container("pmm-agent", "pmm-client@sha256:2"),
+			container("pmm-init", "pmm-client@sha256:2"),
+			container("done", "done@sha256:0"),
+		},
+	}
+
+	t.Run("a Syft failure fails only that image", func(t *testing.T) {
+		gen := &fakeGenerator{fail: map[string]bool{"mysql@sha256:1": true}}
+		ta := &fakeTarget{}
+		p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{ta}, imageMap: map[string]bool{}}
+
+		processed, err := p.processPod(pod)
+		assert.Error(t, err)
+		assert.Equal(t, []string{"pmm-agent", "pmm-init"}, containerNames(processed))
+		assert.Equal(t, []string{"mysql@sha256:1", "pmm-client@sha256:2"}, gen.scanned, "each image is scanned once, annotated containers are skipped")
+		assert.Equal(t, map[string]bool{"pmm-client@sha256:2": true}, p.imageMap)
+		assert.Len(t, ta.received, 1)
+	})
+
+	t.Run("a target failure fails the image and is retried", func(t *testing.T) {
+		gen := &fakeGenerator{}
+		ok := &fakeTarget{}
+		failing := &fakeTarget{fail: map[string]bool{"pmm-client@sha256:2": true}}
+		p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{ok, failing}, imageMap: map[string]bool{}}
+
+		processed, err := p.processPod(pod)
+		assert.Error(t, err)
+		assert.Equal(t, []string{"mysql"}, containerNames(processed))
+		assert.False(t, p.imageMap["pmm-client@sha256:2"])
+
+		// once the target recovers, the image is sent again
+		failing.fail = nil
+		processed, err = p.processPod(pod)
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"mysql", "pmm-agent", "pmm-init"}, containerNames(processed))
+		assert.Equal(t, []string{"mysql@sha256:1", "pmm-client@sha256:2", "pmm-client@sha256:2"}, gen.scanned, "only the failed image is scanned again")
+	})
+
+	t.Run("another pod's failure doesn't count as processed", func(t *testing.T) {
+		gen := &fakeGenerator{fail: map[string]bool{"pmm-client@sha256:2": true}}
+		p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{&fakeTarget{}}, imageMap: map[string]bool{}}
+
+		_, err := p.processPod(pod)
+		assert.Error(t, err)
+
+		other := libk8s.PodInfo{PodName: "mysql-1", PodNamespace: "db", Containers: []*libk8s.ContainerInfo{container("pmm-agent", "pmm-client@sha256:2")}}
+		processed, err := p.processPod(other)
+		assert.Error(t, err)
+		assert.Empty(t, processed)
+	})
+
+	t.Run("images processed for another pod aren't sent again", func(t *testing.T) {
+		gen := &fakeGenerator{}
+		ta := &fakeTarget{}
+		p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{ta}, imageMap: map[string]bool{"mysql@sha256:1": true, "pmm-client@sha256:2": true}}
+
+		processed, err := p.processPod(pod)
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"mysql", "pmm-agent", "pmm-init"}, containerNames(processed))
+		assert.Empty(t, gen.scanned)
+		assert.Empty(t, ta.received)
+	})
 }
