@@ -208,6 +208,7 @@ not present in the cluster anymore are removed from the configured targets (exce
 | `dtrack-parent-project-annotation-key` | `false` | `""` | Kubernetes pod annotation key to set parent project automatically, e.g. "my.pod.annotation" |
 | `dtrack-project-name-annotation-key` | `false` | `""` | Kubernetes pod annotation key to set custom dtrack project name automatically, e.g. "my.pod.annotation" |
 | `dtrack-manage-project-active-status` | `true` when enabled without parent config | `false` | Manage project active/isLatest status based on running pods. Orphans are deactivated instead of deleted. Requires a parent project. |
+| `dtrack-timeout` | `false` | `"60s"` | Timeout for each Dependency-Track API request, as a duration (`90s`, `5m`) or a number of seconds. Dependency-Track only answers a BOM upload once it has processed it, which can take tens of seconds for images with tens of thousands of components. Before this flag existed the timeout was fixed at 10s. |
 | `kubernetes-cluster-id` | `false` | `"default"` | Kubernetes Cluster ID (to be used in Dependency-Track or Job-Images) |
 
 Each image in the cluster is created as project with the full-image name (registry and image-path without tag) and the image-tag as project-version.

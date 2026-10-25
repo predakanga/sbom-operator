@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	dtrack "github.com/DependencyTrack/client-go"
 	"github.com/google/uuid"
@@ -33,9 +35,11 @@ type DependencyTrackTarget struct {
 	k8sClusterIdMode           string
 	useShortName               bool
 	manageProjectActiveStatus  bool
+	timeout                    string
 	imageProjectMap            map[string]uuid.UUID
 
 	defaultParentProjectParsed *uuid.UUID
+	timeoutParsed              time.Duration
 }
 
 const (
@@ -43,9 +47,14 @@ const (
 	sbomOperator       = "sbom-operator"
 	rawImageId         = "raw-image-id"
 	podNamespaceTagKey = "namespace"
+
+	// DefaultTimeout is used when no timeout is configured. Dependency-Track
+	// processes a BOM before replying to the upload, which takes well over the
+	// client's own 10s default for images with tens of thousands of components.
+	DefaultTimeout = 60 * time.Second
 )
 
-func NewDependencyTrackTarget(baseUrl, apiKey, podLabelTagMatcher, caCertFile, clientCertFile, clientKeyFile, k8sClusterId string, k8sClusterIdMode string, defaultParentProject string, parentProjectAnnotationKey string, projectNameAnnotationKey string, useShortName bool, manageProjectActiveStatus bool) *DependencyTrackTarget {
+func NewDependencyTrackTarget(baseUrl, apiKey, podLabelTagMatcher, caCertFile, clientCertFile, clientKeyFile, k8sClusterId string, k8sClusterIdMode string, defaultParentProject string, parentProjectAnnotationKey string, projectNameAnnotationKey string, useShortName bool, manageProjectActiveStatus bool, timeout string) *DependencyTrackTarget {
 	return &DependencyTrackTarget{
 		baseUrl:                    baseUrl,
 		apiKey:                     apiKey,
@@ -60,6 +69,7 @@ func NewDependencyTrackTarget(baseUrl, apiKey, podLabelTagMatcher, caCertFile, c
 		projectNameAnnotationKey:   projectNameAnnotationKey,
 		useShortName:               useShortName,
 		manageProjectActiveStatus:  manageProjectActiveStatus,
+		timeout:                    timeout,
 	}
 }
 
@@ -99,6 +109,12 @@ func (g *DependencyTrackTarget) ValidateConfig() error {
 		g.defaultParentProjectParsed = nil
 	}
 
+	timeout, err := parseTimeout(g.timeout)
+	if err != nil {
+		return fmt.Errorf("%s is invalid: %w", internal.ConfigKeyDependencyTrackTimeout, err)
+	}
+	g.timeoutParsed = timeout
+
 	if g.manageProjectActiveStatus && g.parentProjectAnnotationKey == "" && g.defaultParentProjectParsed == nil {
 		return fmt.Errorf(
 			"%s is enabled but no parent project is configured (set %s or %s)",
@@ -120,7 +136,37 @@ func (g *DependencyTrackTarget) Initialize() error {
 		g.clientOptions = append(g.clientOptions, dtrack.WithMTLS(g.caCertFile, g.clientCertFile, g.clientKeyFile))
 	}
 
+	timeout := g.timeoutParsed
+	if timeout == 0 {
+		timeout = DefaultTimeout
+	}
+	g.clientOptions = append(g.clientOptions, dtrack.WithTimeout(timeout))
+
 	return nil
+}
+
+// parseTimeout parses a Go duration ("90s", "2m"). A bare number is taken as
+// seconds. An empty value selects DefaultTimeout.
+func parseTimeout(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return DefaultTimeout, nil
+	}
+
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		seconds, numErr := strconv.ParseInt(value, 10, 64)
+		if numErr != nil {
+			return 0, err
+		}
+		timeout = time.Duration(seconds) * time.Second
+	}
+
+	if timeout <= 0 {
+		return 0, fmt.Errorf("timeout must be positive, got %q", value)
+	}
+
+	return timeout, nil
 }
 
 func (g *DependencyTrackTarget) identifyProjectNameAndVersion(ctx *target.TargetContext) (string, string) {
