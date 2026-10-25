@@ -24,6 +24,7 @@ import (
 	targetoci "github.com/ckotzbauer/sbom-operator/internal/target/oci"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -41,6 +42,10 @@ type Processor struct {
 	imageMap          map[string]bool
 	allowedNamespaces map[string]bool
 	namespaceMutex    sync.RWMutex
+
+	// informer mode only, see queue.go
+	queue    workqueue.TypedRateLimitingInterface[workItem]
+	podStore cache.Store
 }
 
 func New(k8s *kubernetes.KubeClient, sy *syft.Syft) *Processor {
@@ -115,7 +120,6 @@ func (p *Processor) ListenForPods() {
 		logrus.Debug("No namespace-label-selector configured, all namespaces will be processed")
 	}
 
-	var informer cache.SharedIndexInformer
 	informer, err := p.K8s.StartPodInformer(internal.OperatorConfig.PodLabelSelector, cache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(old, new interface{}) {
 			oldPod := old.(*corev1.Pod)
@@ -131,13 +135,22 @@ func (p *Processor) ListenForPods() {
 			newInfo := p.K8s.Client.ExtractPodInfos(*newPod)
 			logrus.Tracef("Pod %s/%s was updated.", newInfo.PodNamespace, newInfo.PodName)
 
-			var removedContainers []*libk8s.ContainerInfo
-			newInfo.Containers, removedContainers = getChangedContainers(oldInfo, newInfo)
-			_ = p.scanPod(newInfo) // errors are logged
-			p.cleanupImagesIfNeeded(removedContainers, informer.GetStore().List())
+			addedContainers, removedContainers := getChangedContainers(oldInfo, newInfo)
+			if len(addedContainers) > 0 {
+				p.queue.Add(scanPodItem(newInfo.PodNamespace, newInfo.PodName))
+			}
+			for _, c := range removedContainers {
+				p.queue.Add(cleanupImageItem(c.Image))
+			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			pod := obj.(*corev1.Pod)
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+			pod, ok := obj.(*corev1.Pod)
+			if !ok {
+				return
+			}
 
 			// Filter by namespace if selector is configured
 			if !p.isNamespaceAllowed(pod.Namespace) {
@@ -147,7 +160,9 @@ func (p *Processor) ListenForPods() {
 
 			info := p.K8s.Client.ExtractPodInfos(*pod)
 			logrus.Tracef("Pod %s/%s was removed.", info.PodNamespace, info.PodName)
-			p.cleanupImagesIfNeeded(info.Containers, informer.GetStore().List())
+			for _, c := range info.Containers {
+				p.queue.Add(cleanupImageItem(c.Image))
+			}
 		},
 	})
 
@@ -155,6 +170,9 @@ func (p *Processor) ListenForPods() {
 		logrus.WithError(err).Fatal("Can't listen for pod-changes.")
 		return
 	}
+
+	p.queue = newWorkQueue()
+	p.podStore = informer.GetStore()
 
 	p.runInformerAsync(informer)
 }
@@ -422,19 +440,39 @@ func (p *Processor) executeSyftScans(pods []libk8s.PodInfo, allImages []*liboci.
 			continue
 		}
 
-		removableImages := make([]*liboci.RegistryImage, 0)
-		for _, t := range targetImages {
-			if !containsImage(allImages, t.ImageID) {
-				removableImages = append(removableImages, t)
-				delete(p.imageMap, t.ImageID)
-				logrus.Debugf("Image %s marked for removal", t.ImageID)
-			}
-		}
+		p.removeOrphans(t, targetImages, allImages)
+	}
+}
 
-		if len(removableImages) > 0 {
-			p.handleOrphanImages(t, removableImages)
+// removeOrphans removes the target's images that aren't in allImages (the
+// images running in the cluster).
+func (p *Processor) removeOrphans(t target.Target, targetImages []*liboci.RegistryImage, allImages []*liboci.RegistryImage) {
+	removableImages := orphanImages(targetImages, allImages)
+	for _, i := range removableImages {
+		delete(p.imageMap, i.ImageID)
+		logrus.Debugf("Image %s marked for removal", i.ImageID)
+	}
+
+	if len(removableImages) > 0 {
+		p.handleOrphanImages(t, removableImages)
+	}
+}
+
+// orphanImages returns the target images that aren't in allImages.
+func orphanImages(targetImages []*liboci.RegistryImage, allImages []*liboci.RegistryImage) []*liboci.RegistryImage {
+	running := make(map[string]bool, len(allImages))
+	for _, i := range allImages {
+		running[i.ImageID] = true
+	}
+
+	orphans := make([]*liboci.RegistryImage, 0)
+	for _, i := range targetImages {
+		if !running[i.ImageID] {
+			orphans = append(orphans, i)
 		}
 	}
+
+	return orphans
 }
 
 // findPodsToScan returns the pods that have at least one container whose image
@@ -541,16 +579,6 @@ func getChangedContainers(oldPod, newPod libk8s.PodInfo) ([]*libk8s.ContainerInf
 	return addedContainers, removedContainers
 }
 
-func containsImage(images []*liboci.RegistryImage, image string) bool {
-	for _, i := range images {
-		if i.ImageID == image {
-			return true
-		}
-	}
-
-	return false
-}
-
 func containsContainerImage(containers []*libk8s.ContainerInfo, image string) bool {
 	for _, c := range containers {
 		if c.Image.ImageID == image {
@@ -559,31 +587,6 @@ func containsContainerImage(containers []*libk8s.ContainerInfo, image string) bo
 	}
 
 	return false
-}
-
-func (p *Processor) cleanupImagesIfNeeded(removedContainers []*libk8s.ContainerInfo, allPods []interface{}) {
-	images := make([]*liboci.RegistryImage, 0)
-
-	for _, c := range removedContainers {
-		found := false
-		for _, po := range allPods {
-			pod := po.(*corev1.Pod)
-			info := p.K8s.Client.ExtractPodInfos(*pod)
-			found = found || containsContainerImage(info.Containers, c.Image.ImageID)
-		}
-
-		if !found {
-			images = append(images, c.Image)
-			delete(p.imageMap, c.Image.ImageID)
-			logrus.Debugf("Image %s marked for removal", c.Image.ImageID)
-		}
-	}
-
-	if len(images) > 0 {
-		for _, t := range p.Targets {
-			p.handleOrphanImages(t, images)
-		}
-	}
 }
 
 // handleOrphanImages dispatches orphan cleanup for a single target. Targets that
@@ -639,40 +642,16 @@ func (p *Processor) runInformerAsync(informer cache.SharedIndexInformer) {
 	}()
 
 	go func() {
-		if !HasJobImage() {
-			logrus.Info("Wait for cache to be synced")
-			if !cache.WaitForCacheSync(stop, informer.HasSynced) {
-				logrus.Fatal("Timed out waiting for the cache to sync")
-			}
-
-			logrus.Info("Finished cache sync")
-			pods := make([]libk8s.PodInfo, 0)
-			for _, po := range informer.GetStore().List() {
-				pod := po.(*corev1.Pod)
-
-				// Filter by namespace if selector is configured
-				if !p.isNamespaceAllowed(pod.Namespace) {
-					logrus.Tracef("Skipping pod %s/%s during initial sync - namespace not in allowed list", pod.Namespace, pod.Name)
-					continue
-				}
-
-				pods = append(pods, p.K8s.Client.ExtractPodInfos(*pod))
-			}
-
-			targetImages := make([][]*liboci.RegistryImage, 0, len(p.Targets))
-			for _, t := range p.Targets {
-				images, err := t.LoadImages()
-				if err != nil {
-					logrus.WithError(err).Error("Failed to load images from target")
-					continue
-				}
-				targetImages = append(targetImages, images)
-			}
-
-			missingPods, allImages := p.findPodsToScan(pods, targetImages)
-			if len(missingPods) > 0 {
-				p.executeSyftScans(missingPods, allImages)
-			}
+		logrus.Info("Wait for cache to be synced")
+		if !cache.WaitForCacheSync(stop, informer.HasSynced) {
+			logrus.Fatal("Timed out waiting for the cache to sync")
 		}
+
+		logrus.Info("Finished cache sync")
+		if !HasJobImage() {
+			p.queue.Add(workItem{kind: workInitialSync})
+		}
+
+		p.runWorker()
 	}()
 }

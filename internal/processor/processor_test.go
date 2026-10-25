@@ -62,6 +62,9 @@ func TestNamespaceLabelMatches(t *testing.T) {
 type fakeTarget struct {
 	received []*target.TargetContext
 	fail     map[string]bool
+	images   []*liboci.RegistryImage
+	loadErr  error
+	removed  []string
 }
 
 func (f *fakeTarget) Initialize() error     { return nil }
@@ -73,8 +76,13 @@ func (f *fakeTarget) ProcessSbom(ctx *target.TargetContext) error {
 	f.received = append(f.received, ctx)
 	return nil
 }
-func (f *fakeTarget) LoadImages() ([]*liboci.RegistryImage, error) { return nil, nil }
-func (f *fakeTarget) Remove(images []*liboci.RegistryImage) error  { return nil }
+func (f *fakeTarget) LoadImages() ([]*liboci.RegistryImage, error) { return f.images, f.loadErr }
+func (f *fakeTarget) Remove(images []*liboci.RegistryImage) error {
+	for _, i := range images {
+		f.removed = append(f.removed, i.ImageID)
+	}
+	return nil
+}
 
 // filteringTarget implements target.MediaTypeFilter.
 type filteringTarget struct {
