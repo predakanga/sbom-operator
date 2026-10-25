@@ -122,7 +122,7 @@ func FetchSbomAttestations(ctx context.Context, img *liboci.RegistryImage, proxy
 
 func isSupportedSbomMediaType(mt types.MediaType) bool {
 	switch mt {
-	case GetMediaType(CycloneDXJSONMediaType), GetMediaType(CycloneDXXMLMediaType), GetMediaType(SPDXJSONMediaType), GetMediaType(SPDXMediaType), GetMediaType(SyftMediaType):
+	case types.MediaType(CycloneDXJSONMediaType), types.MediaType(CycloneDXXMLMediaType), types.MediaType(SPDXJSONMediaType), types.MediaType(SPDXMediaType), types.MediaType(SyftMediaType):
 		return true
 	default:
 		return false
@@ -152,11 +152,11 @@ func extractFromDsseEnvelope(rawEnvelope []byte) (string, types.MediaType, bool)
 func mapPredicateTypeToMediaType(predicateType string) types.MediaType {
 	switch {
 	case strings.HasPrefix(predicateType, "https://cyclonedx.org/"):
-		return GetMediaType(CycloneDXJSONMediaType)
+		return types.MediaType(CycloneDXJSONMediaType)
 	case strings.HasPrefix(predicateType, "https://spdx.dev/"):
-		return GetMediaType(SPDXJSONMediaType)
+		return types.MediaType(SPDXJSONMediaType)
 	case strings.HasPrefix(predicateType, "https://syft.anchore.com/"):
-		return GetMediaType(SyftMediaType)
+		return types.MediaType(SyftMediaType)
 	default:
 		return ""
 	}
