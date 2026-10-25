@@ -2,6 +2,7 @@ package dtrack
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	dtrack "github.com/DependencyTrack/client-go"
 	libk8s_real "github.com/ckotzbauer/libk8soci/pkg/kubernetes"
 	liboci "github.com/ckotzbauer/libk8soci/pkg/oci"
+	"github.com/ckotzbauer/sbom-operator/internal"
 	"github.com/ckotzbauer/sbom-operator/internal/oci"
 	"github.com/ckotzbauer/sbom-operator/internal/target"
 	"github.com/google/uuid"
@@ -522,62 +524,42 @@ func TestRemoveMinimal(t *testing.T) {
 	_ = g.Remove(images)
 }
 
-// TestRawImageIdTagIsRotated ensures the raw-image-id tag is updated to reflect
-// the current container digest each time ProcessSbom runs against an existing
-// project. The previous behaviour froze the first digest forever and produced
-// false orphans during cleanup when the same (projectName, version) was backed
-// by a different digest (mutable :latest, re-pushed tag, multiple pods).
-func TestRawImageIdTagIsRotated(t *testing.T) {
+func TestAddRawImageIdTag(t *testing.T) {
 	t.Run("first digest is added", func(t *testing.T) {
-		project := dtrack.Project{Tags: []dtrack.Tag{{Name: sbomOperator}}}
-		ctx := &target.TargetContext{Image: &liboci.RegistryImage{ImageID: "alpine@sha256:aaa"}}
-
-		project.Tags = rotateRawImageIdTag(project.Tags, ctx.Image.ImageID)
-
-		assert.Len(t, project.Tags, 2)
-		assert.Equal(t, sbomOperator, project.Tags[0].Name)
-		assert.Equal(t, "raw-image-id=alpine@sha256:aaa", project.Tags[1].Name)
+		tags := addRawImageIdTag([]dtrack.Tag{{Name: sbomOperator}}, "alpine@sha256:aaa")
+		assert.Equal(t, []dtrack.Tag{{Name: sbomOperator}, {Name: "raw-image-id=alpine@sha256:aaa"}}, tags)
 	})
 
-	t.Run("existing digest is replaced, not appended", func(t *testing.T) {
-		project := dtrack.Project{Tags: []dtrack.Tag{
+	t.Run("another digest is added next to the existing one", func(t *testing.T) {
+		tags := addRawImageIdTag([]dtrack.Tag{
 			{Name: sbomOperator},
 			{Name: "raw-image-id=alpine@sha256:aaa"},
 			{Name: "kubernetes-cluster=my-cluster"},
-		}}
-
-		project.Tags = rotateRawImageIdTag(project.Tags, "alpine@sha256:bbb")
-
-		assert.Len(t, project.Tags, 3)
-		// raw-image-id replaced, other tags kept
-		var rawTags []string
-		for _, tag := range project.Tags {
-			if strings.HasPrefix(tag.Name, "raw-image-id=") {
-				rawTags = append(rawTags, tag.Name)
-			}
-		}
-		assert.Equal(t, []string{"raw-image-id=alpine@sha256:bbb"}, rawTags)
-		assert.True(t, containsTag(project.Tags, sbomOperator))
-		assert.True(t, containsTag(project.Tags, "kubernetes-cluster=my-cluster"))
+		}, "alpine@sha256:bbb")
+		assert.Equal(t, []string{"alpine@sha256:aaa", "alpine@sha256:bbb"}, getRawImageIds(tags))
+		assert.Len(t, tags, 4)
 	})
 
-	t.Run("multiple stale raw-image-id tags collapsed to one", func(t *testing.T) {
-		project := dtrack.Project{Tags: []dtrack.Tag{
-			{Name: "raw-image-id=alpine@sha256:aaa"},
-			{Name: "raw-image-id=alpine@sha256:bbb"},
-			{Name: sbomOperator},
-		}}
-
-		project.Tags = rotateRawImageIdTag(project.Tags, "alpine@sha256:ccc")
-
-		var rawTags []string
-		for _, tag := range project.Tags {
-			if strings.HasPrefix(tag.Name, "raw-image-id=") {
-				rawTags = append(rawTags, tag.Name)
-			}
-		}
-		assert.Equal(t, []string{"raw-image-id=alpine@sha256:ccc"}, rawTags)
+	t.Run("a recorded digest isn't added twice", func(t *testing.T) {
+		tags := addRawImageIdTag([]dtrack.Tag{{Name: "raw-image-id=alpine@sha256:aaa"}}, "alpine@sha256:aaa")
+		assert.Equal(t, []string{"alpine@sha256:aaa"}, getRawImageIds(tags))
 	})
+
+	t.Run("a digest that is a prefix of a recorded one is added", func(t *testing.T) {
+		tags := addRawImageIdTag([]dtrack.Tag{{Name: "raw-image-id=alpine@sha256:aaab"}}, "alpine@sha256:aaa")
+		assert.Equal(t, []string{"alpine@sha256:aaab", "alpine@sha256:aaa"}, getRawImageIds(tags))
+	})
+}
+
+func TestRemoveRawImageIdTags(t *testing.T) {
+	tags := []dtrack.Tag{
+		{Name: sbomOperator},
+		{Name: "raw-image-id=alpine@sha256:aaa"},
+		{Name: "raw-image-id=alpine@sha256:bbb"},
+		{Name: "raw-image-id=alpine@sha256:ccc"},
+	}
+	result := removeRawImageIdTags(tags, []string{"alpine@sha256:aaa", "alpine@sha256:ccc"})
+	assert.Equal(t, []dtrack.Tag{{Name: sbomOperator}, {Name: "raw-image-id=alpine@sha256:bbb"}}, result)
 }
 
 // TestLoadImagesResetsImageProjectMap ensures stale digest -> UUID entries do
@@ -661,12 +643,13 @@ func TestLoadImagesTagMode(t *testing.T) {
 	_, _ = g.LoadImages()
 }
 
-func TestGetRawImageId(t *testing.T) {
-	assert.Equal(t, "", getRawImageId([]dtrack.Tag{{Name: "sbom-operator"}}))
-	assert.Equal(t, "alpine@sha256:aaa", getRawImageId([]dtrack.Tag{{Name: "raw-image-id=alpine@sha256:aaa"}}))
-	assert.Equal(t, "alpine@sha256:bbb", getRawImageId([]dtrack.Tag{
-		{Name: "sbom-operator"},
+func TestGetRawImageIds(t *testing.T) {
+	assert.Empty(t, getRawImageIds([]dtrack.Tag{{Name: "sbom-operator"}}))
+	assert.Equal(t, []string{"alpine@sha256:aaa"}, getRawImageIds([]dtrack.Tag{{Name: "raw-image-id=alpine@sha256:aaa"}}))
+	assert.Equal(t, []string{"alpine@sha256:bbb", "alpine@sha256:ccc"}, getRawImageIds([]dtrack.Tag{
 		{Name: "raw-image-id=alpine@sha256:bbb"},
+		{Name: "sbom-operator"},
+		{Name: "raw-image-id=alpine@sha256:ccc"},
 		{Name: "namespace=default"},
 	}))
 }
@@ -1167,4 +1150,230 @@ func TestProcessSbomTagsProjectAfterUploadTimeout(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeDependencyTrack keeps projects by UUID and records changes to them.
+type fakeDependencyTrack struct {
+	projects map[string]*dtrack.Project
+	updated  []string
+	deleted  []string
+	patched  []string
+}
+
+func newFakeDependencyTrack(t *testing.T, projects ...dtrack.Project) (*fakeDependencyTrack, string) {
+	f := &fakeDependencyTrack{projects: map[string]*dtrack.Project{}}
+	for i := range projects {
+		f.projects[projects[i].UUID.String()] = &projects[i]
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id := strings.TrimPrefix(r.URL.Path, "/api/v1/project/")
+		switch {
+		case r.URL.Path == "/api/version":
+			_, _ = w.Write([]byte(`{"version": "4.12.0"}`))
+		case r.URL.Path == "/api/v1/project" && r.Method == http.MethodGet:
+			all := make([]dtrack.Project, 0, len(f.projects))
+			for _, p := range projects {
+				all = append(all, *f.projects[p.UUID.String()])
+			}
+			w.Header().Set("X-Total-Count", fmt.Sprint(len(all)))
+			_ = json.NewEncoder(w).Encode(all)
+		case r.URL.Path == "/api/v1/project" && r.Method == http.MethodPost:
+			var p dtrack.Project
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			f.projects[p.UUID.String()] = &p
+			f.updated = append(f.updated, p.UUID.String())
+			_ = json.NewEncoder(w).Encode(p)
+		case r.Method == http.MethodGet && f.projects[id] != nil:
+			_ = json.NewEncoder(w).Encode(f.projects[id])
+		case r.Method == http.MethodDelete:
+			delete(f.projects, id)
+			f.deleted = append(f.deleted, id)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPatch:
+			f.patched = append(f.patched, id)
+			f.projects[id].Active = false
+			_ = json.NewEncoder(w).Encode(f.projects[id])
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return f, ts.URL
+}
+
+func multiDigestProject(id string, active bool, extraTags ...string) dtrack.Project {
+	tags := []dtrack.Tag{
+		{Name: sbomOperator},
+		{Name: "kubernetes-cluster=my-cluster"},
+		{Name: "raw-image-id=thelounge@sha256:aaa"},
+		{Name: "raw-image-id=thelounge@sha256:bbb"},
+	}
+	for _, tag := range extraTags {
+		tags = append(tags, dtrack.Tag{Name: tag})
+	}
+	return dtrack.Project{UUID: uuid.MustParse(id), Name: "ghcr.io/thelounge/thelounge", Version: "4.4.3", Active: active, Tags: tags}
+}
+
+func registryImages(ids ...string) []*liboci.RegistryImage {
+	images := make([]*liboci.RegistryImage, 0, len(ids))
+	for _, id := range ids {
+		images = append(images, &liboci.RegistryImage{ImageID: id})
+	}
+	return images
+}
+
+// Two pods of a Deployment can run different digests of a re-pushed tag. Both
+// must be recorded, or one always looks missing and is rescanned forever.
+func TestLoadImagesReturnsEveryDigest(t *testing.T) {
+	projectUUID := "11111111-2222-3333-4444-555555555555"
+	_, url := newFakeDependencyTrack(t, multiDigestProject(projectUUID, true))
+
+	g := NewDependencyTrackTarget(url, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", false, false, "")
+	require.NoError(t, g.Initialize())
+
+	images, err := g.LoadImages()
+	require.NoError(t, err)
+	ids := make([]string, 0)
+	for _, i := range images {
+		ids = append(ids, i.ImageID)
+	}
+	assert.Equal(t, []string{"thelounge@sha256:aaa", "thelounge@sha256:bbb"}, ids)
+	assert.Equal(t, projectUUID, g.imageProjectMap["thelounge@sha256:aaa"].String())
+	assert.Equal(t, projectUUID, g.imageProjectMap["thelounge@sha256:bbb"].String())
+}
+
+func TestProcessSbomKeepsOtherDigests(t *testing.T) {
+	var updatedTags []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/bom":
+			_, _ = w.Write([]byte(`{"token": "tok"}`))
+		case r.URL.Path == "/api/v1/project/lookup":
+			_, _ = w.Write([]byte(`{"name": "ghcr.io/thelounge/thelounge", "version": "4.4.3", "uuid": "11111111-2222-3333-4444-555555555555",
+				"tags": [{"name": "sbom-operator"}, {"name": "kubernetes-cluster=my-cluster"}, {"name": "raw-image-id=thelounge@sha256:aaa"}]}`))
+		case r.URL.Path == "/api/v1/project" && r.Method == http.MethodPost:
+			var p dtrack.Project
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			for _, tag := range p.Tags {
+				updatedTags = append(updatedTags, tag.Name)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer ts.Close()
+
+	g := NewDependencyTrackTarget(ts.URL, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", false, false, "")
+	require.NoError(t, g.Initialize())
+	g.imageProjectMap = map[string]uuid.UUID{}
+
+	err := g.ProcessSbom(&target.TargetContext{
+		Image:      &liboci.RegistryImage{ImageID: "thelounge@sha256:bbb", Image: "ghcr.io/thelounge/thelounge:4.4.3"},
+		Pod:        &libk8s_real.PodInfo{PodNamespace: "default"},
+		Containers: []*libk8s_real.ContainerInfo{{Name: "thelounge"}},
+		Sbom:       "{}",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, updatedTags, "raw-image-id=thelounge@sha256:aaa")
+	assert.Contains(t, updatedTags, "raw-image-id=thelounge@sha256:bbb")
+}
+
+func TestRemoveOnlyDropsOrphanedDigests(t *testing.T) {
+	projectUUID := "11111111-2222-3333-4444-555555555555"
+
+	tests := []struct {
+		name            string
+		project         dtrack.Project
+		orphans         []string
+		expectDeleted   bool
+		expectUpdated   bool
+		expectedDigests []string
+	}{
+		{
+			name:            "a digest still running keeps the project",
+			project:         multiDigestProject(projectUUID, true),
+			orphans:         []string{"thelounge@sha256:aaa"},
+			expectUpdated:   true,
+			expectedDigests: []string{"thelounge@sha256:bbb"},
+		},
+		{
+			name:          "the project is removed with its last digest",
+			project:       multiDigestProject(projectUUID, true),
+			orphans:       []string{"thelounge@sha256:aaa", "thelounge@sha256:bbb"},
+			expectDeleted: true,
+		},
+		{
+			name:            "digests of a project used by other clusters are kept",
+			project:         multiDigestProject(projectUUID, true, "kubernetes-cluster=other-cluster"),
+			orphans:         []string{"thelounge@sha256:aaa"},
+			expectedDigests: []string{"thelounge@sha256:aaa", "thelounge@sha256:bbb"},
+		},
+		{
+			name:            "the cluster tag is removed with the last digest, if other clusters use the project",
+			project:         multiDigestProject(projectUUID, true, "kubernetes-cluster=other-cluster"),
+			orphans:         []string{"thelounge@sha256:aaa", "thelounge@sha256:bbb"},
+			expectUpdated:   true,
+			expectedDigests: []string{"thelounge@sha256:aaa", "thelounge@sha256:bbb"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			internal.OperatorConfig = &internal.Config{}
+			dt, url := newFakeDependencyTrack(t, tt.project)
+
+			g := NewDependencyTrackTarget(url, "apikey", "", "", "", "", "my-cluster", "tag", "", "", "", false, false, "")
+			require.NoError(t, g.Initialize())
+			_, err := g.LoadImages()
+			require.NoError(t, err)
+
+			require.NoError(t, g.Remove(registryImages(tt.orphans...)))
+			if tt.expectDeleted {
+				assert.Equal(t, []string{projectUUID}, dt.deleted)
+				return
+			}
+			assert.Empty(t, dt.deleted)
+			if tt.expectUpdated {
+				assert.Equal(t, []string{projectUUID}, dt.updated)
+			} else {
+				assert.Empty(t, dt.updated)
+			}
+			assert.Equal(t, tt.expectedDigests, getRawImageIds(dt.projects[projectUUID].Tags))
+		})
+	}
+}
+
+func TestDeactivateOnlyDropsOrphanedDigests(t *testing.T) {
+	projectUUID := "11111111-2222-3333-4444-555555555555"
+
+	t.Run("a digest still running keeps the project active", func(t *testing.T) {
+		dt, url := newFakeDependencyTrack(t, multiDigestProject(projectUUID, true))
+		g := NewDependencyTrackTarget(url, "apikey", "", "", "", "", "my-cluster", "tag", "8c940608-8e62-431a-ac5d-2092b7c41372", "", "", false, true, "")
+		require.NoError(t, g.ValidateConfig())
+		require.NoError(t, g.Initialize())
+		_, err := g.LoadImages()
+		require.NoError(t, err)
+
+		require.NoError(t, g.Deactivate(registryImages("thelounge@sha256:aaa")))
+		assert.Empty(t, dt.patched)
+		assert.True(t, dt.projects[projectUUID].Active)
+		assert.Equal(t, []string{"thelounge@sha256:bbb"}, getRawImageIds(dt.projects[projectUUID].Tags))
+	})
+
+	t.Run("the project is deactivated with its last digest", func(t *testing.T) {
+		dt, url := newFakeDependencyTrack(t, multiDigestProject(projectUUID, true))
+		g := NewDependencyTrackTarget(url, "apikey", "", "", "", "", "my-cluster", "tag", "8c940608-8e62-431a-ac5d-2092b7c41372", "", "", false, true, "")
+		require.NoError(t, g.ValidateConfig())
+		require.NoError(t, g.Initialize())
+		_, err := g.LoadImages()
+		require.NoError(t, err)
+
+		require.NoError(t, g.Deactivate(registryImages("thelounge@sha256:aaa", "thelounge@sha256:bbb")))
+		assert.Equal(t, []string{projectUUID}, dt.patched)
+		assert.Equal(t, []string{"thelounge@sha256:aaa", "thelounge@sha256:bbb"}, getRawImageIds(dt.projects[projectUUID].Tags), "digests are kept for reactivation")
+	})
 }
