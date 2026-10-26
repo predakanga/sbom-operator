@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/ckotzbauer/sbom-operator/internal/kubernetes"
 	"github.com/ckotzbauer/sbom-operator/internal/processor"
 	"github.com/ckotzbauer/sbom-operator/internal/syft"
+	"github.com/ckotzbauer/sbom-operator/internal/trivy"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	_ "modernc.org/sqlite" // Required for RPM database cataloging in Syft
@@ -34,6 +37,13 @@ func newRootCmd() *cobra.Command {
 			internal.OperatorConfig = &internal.Config{}
 			if err := libstandard.DefaultInitializer(internal.OperatorConfig, cmd, "sbom-operator"); err != nil {
 				return err
+			}
+			if err := validateGenerator(internal.OperatorConfig); err != nil {
+				return err
+			}
+			if internal.OperatorConfig.Generator == generatorTrivy {
+				// Trivy picks its own spec version, so the rest is Syft's
+				return nil
 			}
 			warnAboutDtrackCycloneDXDefault(internal.OperatorConfig)
 			// Resolve format-version through the single unified entry point.
@@ -68,11 +78,12 @@ func newRootCmd() *cobra.Command {
 				internal.OperatorConfig.FormatVersion,
 			)
 
+			sy := newGenerator(&fv)
+
 			if internal.OperatorConfig.Cron != "" {
-				daemon.Start(internal.OperatorConfig.Cron, Version, &fv)
+				daemon.Start(internal.OperatorConfig.Cron, sy)
 			} else {
 				k8s := kubernetes.NewClient(internal.OperatorConfig.IgnoreAnnotations, internal.OperatorConfig.FallbackPullSecret)
-				sy := syft.New(internal.OperatorConfig.Format, libstandard.ToMap(internal.OperatorConfig.RegistryProxies), Version, &fv, internal.OperatorConfig.StripCpes)
 				p := processor.New(k8s, sy)
 				p.ListenForPods()
 			}
@@ -131,6 +142,8 @@ func newRootCmd() *cobra.Command {
 	rootCmd.PersistentFlags().String(internal.ConfigKeyFormatVersion, "", syft.FormatVersionHelp())
 	rootCmd.PersistentFlags().Bool(internal.ConfigKeyStripCpes, false, "Strip CPE attributes from all components in generated SBOMs. Disables Syft CPE generation and removes cataloger-sourced CPEs.")
 	rootCmd.PersistentFlags().Bool(internal.ConfigKeyFetchOciAttestations, false, "Fetch additional CycloneDX SBOMs from OCI attestations")
+	rootCmd.PersistentFlags().String(internal.ConfigKeyGenerator, generatorSyft, "SBOM generator for images without a usable attestation (syft, trivy). trivy runs the trivy CLI from PATH, and supports the formats cyclonedxjson, spdxjson and spdx.")
+	rootCmd.PersistentFlags().String(internal.ConfigKeyTrivyCacheDir, filepath.Join(os.TempDir(), "trivy"), "Cache directory for the trivy generator. Trivy keeps its Java DB (~1.5GB) here.")
 	return rootCmd
 }
 
@@ -159,6 +172,46 @@ func warnAboutDtrackCycloneDXDefault(config *internal.Config) {
 		"sbom_family":  formatVersion.Family,
 		"sbom_version": formatVersion.Version,
 	}).Warn("Dependency-Track releases through 5.0.x reject the bundled default CycloneDX version; set --format-version=1.6")
+}
+
+const (
+	generatorSyft  = "syft"
+	generatorTrivy = "trivy"
+)
+
+// validateGenerator checks that the configured generator can write the
+// configured format.
+func validateGenerator(config *internal.Config) error {
+	switch config.Generator {
+	case generatorSyft:
+		return nil
+	case generatorTrivy:
+		if _, err := trivy.Format(config.Format); err != nil {
+			return err
+		}
+		if strings.TrimSpace(config.FormatVersion) != "" {
+			return trivy.ErrUnsupportedFormatVersion
+		}
+		if config.StripCpes {
+			logrus.Warn("--strip-cpes only applies to the syft generator")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown generator %q, use syft or trivy", config.Generator)
+	}
+}
+
+// newGenerator returns the configured SBOM generator.
+func newGenerator(fv *syft.FormatVersion) processor.SbomGenerator {
+	if internal.OperatorConfig.Generator == generatorTrivy {
+		tr, err := trivy.New(internal.OperatorConfig.Format, internal.OperatorConfig.TrivyCacheDir, libstandard.ToMap(internal.OperatorConfig.RegistryProxies))
+		if err != nil {
+			logrus.WithError(err).Fatal("Invalid generator configuration")
+		}
+		return tr
+	}
+
+	return syft.New(internal.OperatorConfig.Format, libstandard.ToMap(internal.OperatorConfig.RegistryProxies), Version, fv, internal.OperatorConfig.StripCpes)
 }
 
 func printVersion() {

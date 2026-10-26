@@ -16,7 +16,6 @@ import (
 	"github.com/ckotzbauer/sbom-operator/internal/job"
 	"github.com/ckotzbauer/sbom-operator/internal/kubernetes"
 	"github.com/ckotzbauer/sbom-operator/internal/oci"
-	"github.com/ckotzbauer/sbom-operator/internal/syft"
 	"github.com/ckotzbauer/sbom-operator/internal/target"
 	"github.com/ckotzbauer/sbom-operator/internal/target/configmap"
 	"github.com/ckotzbauer/sbom-operator/internal/target/dtrack"
@@ -31,14 +30,15 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 )
 
-// sbomGenerator creates an SBOM for an image (implemented by syft.Syft).
-type sbomGenerator interface {
+// SbomGenerator creates an SBOM for an image (implemented by syft.Syft and
+// trivy.Trivy).
+type SbomGenerator interface {
 	ExecuteSyft(img *liboci.RegistryImage) (string, error)
 }
 
 type Processor struct {
 	K8s               *kubernetes.KubeClient
-	sy                sbomGenerator
+	sy                SbomGenerator
 	Targets           []target.Target
 	imageMap          map[string]bool
 	bareDigestsWarned map[string]bool
@@ -50,7 +50,7 @@ type Processor struct {
 	podStore cache.Store
 }
 
-func New(k8s *kubernetes.KubeClient, sy *syft.Syft) *Processor {
+func New(k8s *kubernetes.KubeClient, sy SbomGenerator) *Processor {
 	targets := make([]target.Target, 0)
 	if !HasJobImage() {
 		logrus.Debugf("Targets set to: %v", internal.OperatorConfig.Targets)

@@ -84,7 +84,7 @@ func newPod(namespace, name string, containerImages ...string) *corev1.Pod {
 
 // newQueueProcessor returns a processor in informer mode, backed by a fake API
 // server and an informer store with the given pods.
-func newQueueProcessor(t *testing.T, gen sbomGenerator, targets []target.Target, pods ...*corev1.Pod) (*Processor, *fakeAPIServer, cache.Store) {
+func newQueueProcessor(t *testing.T, gen SbomGenerator, targets []target.Target, pods ...*corev1.Pod) (*Processor, *fakeAPIServer, cache.Store) {
 	t.Helper()
 
 	retryBaseDelay, retryMaxDelay = time.Millisecond, 10*time.Millisecond

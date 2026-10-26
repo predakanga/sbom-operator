@@ -74,6 +74,8 @@ All parameters are cli-flags. The flags can be configured as args or as environm
 | `delete-orphan-images` | `false` | `true` | Delete orphan images automatically |
 | `strip-cpes` | `false` | `false` | Strip CPE attributes from all components in generated SBOMs (Syft-JSON `cpes`, CycloneDX `cpe`). Disables Syft CPE generation and removes cataloger-sourced CPEs. Flag can be set via `SBOM_STRIP_CPES` env var or `stripCpes` in YAML. |
 | `fetch-oci-attestations` | `false` | `false` | Fetch SBOMs from OCI attestations via cosign (Main SBOM of image & optional configured additional SBOMs). In case main SBOM from image can't be found, falls back to syft generation. Flag can be set via `FETCH_OCI_ATTESTATIONS` env var or `fetchOciAttestations` in YAML. |
+| `generator` | `false` | `syft` | SBOM generator for images without a usable attestation: `syft`, or `trivy` to run the bundled Trivy CLI. Trivy's SBOMs name distros and record source packages the way Trivy's vulnerability matching expects, so they suit Dependency-Track's Trivy analyzer. `trivy` supports the formats `cyclonedxjson`, `spdxjson` and `spdx`, always writes its own spec version (so `format-version` must be unset), and ignores `strip-cpes`. Flag can be set via `SBOM_GENERATOR` env var or `generator` in YAML. |
+| `trivy-cache-dir` | `false` | `/tmp/trivy` | Cache directory for the `trivy` generator. Trivy keeps its Java DB here (~1.5GB, refreshed every 3 days), so it needs to be writable and large enough. Flag can be set via `SBOM_TRIVY_CACHE_DIR` env var or `trivyCacheDir` in YAML. |
 
 ### Fetching SBOM from OCI
 
