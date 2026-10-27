@@ -534,7 +534,12 @@ func (p *Processor) findPodsToScan(pods []libk8s.PodInfo, targetImages [][]*libo
 				allImages = append(allImages, c.Image)
 			}
 
-			if needsAnalysis || isBareDigest(c.Image.ImageID) || p.K8s.HasAnnotation(info.Annotations, c) {
+			if needsAnalysis || p.K8s.HasAnnotation(info.Annotations, c) {
+				continue
+			}
+			if isBareDigest(c.Image.ImageID) {
+				// the pod may never be scanned, so warn here
+				p.warnBareDigest(info, c)
 				continue
 			}
 

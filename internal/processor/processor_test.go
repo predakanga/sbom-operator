@@ -3,6 +3,7 @@ package processor
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	libk8s "github.com/ckotzbauer/libk8soci/pkg/kubernetes"
@@ -11,6 +12,8 @@ import (
 	"github.com/ckotzbauer/sbom-operator/internal/kubernetes"
 	"github.com/ckotzbauer/sbom-operator/internal/oci"
 	"github.com/ckotzbauer/sbom-operator/internal/target"
+	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -422,4 +425,30 @@ func TestBareDigestImagesAreSkipped(t *testing.T) {
 	onlyBare := libk8s.PodInfo{PodName: "coredns-1", PodNamespace: "kube-system", Containers: []*libk8s.ContainerInfo{container("coredns", bare)}}
 	missing, _ := p.findPodsToScan([]libk8s.PodInfo{onlyBare}, [][]*liboci.RegistryImage{images()})
 	assert.Empty(t, missing, "a bare digest alone doesn't make a pod need analysis")
+}
+
+func TestBareDigestWarningDuringInitialSync(t *testing.T) {
+	internal.OperatorConfig = &internal.Config{}
+	bare := "sha256:7c3a6a8f5c2e1d0b9a8f7e6d5c4b3a2918273645546372819a0b1c2d3e4f5a6b"
+	hook := logtest.NewGlobal()
+	t.Cleanup(hook.Reset)
+
+	// pods with only a bare-digest container are never queued, so the
+	// initial sync has to warn about them itself
+	pods := []libk8s.PodInfo{
+		{PodName: "coredns-0", PodNamespace: "kube-system", Containers: []*libk8s.ContainerInfo{container("coredns", bare)}},
+		{PodName: "coredns-1", PodNamespace: "kube-system", Containers: []*libk8s.ContainerInfo{container("coredns", bare)}},
+	}
+	p := &Processor{K8s: &kubernetes.KubeClient{}}
+	missing, _ := p.findPodsToScan(pods, [][]*liboci.RegistryImage{images()})
+	assert.Empty(t, missing, "a bare digest alone doesn't make a pod need analysis")
+	p.findPodsToScan(pods, [][]*liboci.RegistryImage{images()})
+
+	warnings := 0
+	for _, e := range hook.AllEntries() {
+		if e.Level == logrus.WarnLevel && strings.Contains(e.Message, bare) {
+			warnings++
+		}
+	}
+	assert.Equal(t, 1, warnings, "the warning is logged once per image")
 }
