@@ -133,8 +133,8 @@ func (p *Processor) ListenForPods() {
 				return
 			}
 
-			oldInfo := p.K8s.Client.ExtractPodInfos(*oldPod)
-			newInfo := p.K8s.Client.ExtractPodInfos(*newPod)
+			oldInfo := p.K8s.ExtractPodInfos(*oldPod)
+			newInfo := p.K8s.ExtractPodInfos(*newPod)
 			logrus.Tracef("Pod %s/%s was updated.", newInfo.PodNamespace, newInfo.PodName)
 
 			addedContainers, removedContainers := getChangedContainers(oldInfo, newInfo)
@@ -160,7 +160,7 @@ func (p *Processor) ListenForPods() {
 				return
 			}
 
-			info := p.K8s.Client.ExtractPodInfos(*pod)
+			info := p.K8s.ExtractPodInfos(*pod)
 			logrus.Tracef("Pod %s/%s was removed.", info.PodNamespace, info.PodName)
 			for _, c := range info.Containers {
 				p.queue.Add(cleanupImageItem(c.Image))

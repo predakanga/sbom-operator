@@ -129,3 +129,59 @@ func TestLoadPullSecrets(t *testing.T) {
 
 	assert.Equal(t, int32(3), gets.Load())
 }
+
+func TestExtractPodInfosTakesPinnedImagesFromSpec(t *testing.T) {
+	pinned := "ghcr.io/predakanga/sbom-operator:0.47.0.3@sha256:ed3409b03659fa0dc7ce044bb8ebf3ecd06b05f2d42d2fda67e45fdfb50cf9a1"
+	imageID := "ghcr.io/predakanga/sbom-operator@sha256:ed3409b03659fa0dc7ce044bb8ebf3ecd06b05f2d42d2fda67e45fdfb50cf9a1"
+	configDigest := "sha256:8072cdef760d20705eee1aa637896df8bc3dc6976c7e69d9202d34087b33fec7"
+	status := func(name, image, imageID string) corev1.ContainerStatus {
+		return corev1.ContainerStatus{Name: name, Image: image, ImageID: imageID}
+	}
+
+	// as containerd reports a name:tag@digest pin, plus other cases
+	pod := &corev1.Pod{
+		ObjectMeta: meta.ObjectMeta{Namespace: "sbom", Name: "sbom-operator-0"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: "operator", Image: pinned, Args: []string{"--targets=dtrack"}},
+				{Name: "tagged", Image: "nginx:1.27"},
+				{Name: "imported", Image: "registry.k8s.io/coredns/coredns:v1.11.1"},
+			},
+			InitContainers:      []corev1.Container{{Name: "init", Image: "busybox:1.37@" + configDigest}},
+			EphemeralContainers: []corev1.EphemeralContainer{{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: "alpine:3.22"}}},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				status("operator", configDigest, imageID),
+				status("tagged", "docker.io/library/nginx:1.27", "docker.io/library/nginx@sha256:1"),
+				status("imported", configDigest, configDigest),
+				status("gone", configDigest, "gone@sha256:2"),
+			},
+			InitContainerStatuses:      []corev1.ContainerStatus{status("init", configDigest, "docker.io/library/busybox@sha256:3")},
+			EphemeralContainerStatuses: []corev1.ContainerStatus{status("debug", configDigest, "docker.io/library/alpine@sha256:4")},
+		},
+	}
+
+	transformed, err := transformPod(pod)
+	require.NoError(t, err)
+	assert.Empty(t, transformed.(*corev1.Pod).Spec.Containers[0].Args, "the transform keeps only names and images")
+
+	client := &KubeClient{Client: &libk8s.KubeClient{}}
+	info := client.ExtractPodInfos(*transformed.(*corev1.Pod))
+
+	images := map[string]string{}
+	imageIDs := map[string]string{}
+	for _, c := range info.Containers {
+		images[c.Name] = c.Image.Image
+		imageIDs[c.Name] = c.Image.ImageID
+	}
+	assert.Equal(t, map[string]string{
+		"operator": pinned,
+		"tagged":   "docker.io/library/nginx:1.27",
+		"imported": "registry.k8s.io/coredns/coredns:v1.11.1",
+		"gone":     configDigest,
+		"init":     "busybox:1.37@" + configDigest,
+		"debug":    "alpine:3.22",
+	}, images, "a bare-digest status image is replaced by the spec's, if there is one")
+	assert.Equal(t, imageID, imageIDs["operator"], "the image ID is unchanged")
+}

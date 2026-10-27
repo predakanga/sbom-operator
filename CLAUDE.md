@@ -340,4 +340,4 @@ kubectl apply -f deploy/job-image/
 - **Scratch-based image**: Final container image is built FROM scratch with only the static binary, CA certs, and timezone data.
 - **Version injection**: Build version, commit, date, and builder are injected via ldflags at build time.
 - **Supported SBOM formats**: `json` (syft), `cyclonedx`/`cyclonedxxml`, `cyclonedxjson`, `spdx`/`spdxtv`/`spdxtagvalue`, `spdxjson`, `github`/`githubjson`, `text`, `table`.
-- **Informer transforms**: Pod and namespace informers use `SetTransform` to strip unnecessary fields, reducing memory usage.
+- **Informer transforms**: Pod and namespace informers use `SetTransform` to strip unnecessary fields, reducing memory usage. Pods keep each spec container's name and image: `KubeClient.ExtractPodInfos` (use it rather than libk8soci's) takes the image from the spec when the status reports a bare digest, as containerd does for `name:tag@digest` pins, so the tag is available as the Dependency-Track project version.
