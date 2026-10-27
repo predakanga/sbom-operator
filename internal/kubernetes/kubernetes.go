@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/sirupsen/logrus"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +19,7 @@ import (
 
 	libk8s "github.com/ckotzbauer/libk8soci/pkg/kubernetes"
 	"github.com/ckotzbauer/libk8soci/pkg/oci"
+	"github.com/ckotzbauer/libk8soci/pkg/util"
 )
 
 type KubeClient struct {
@@ -49,30 +51,77 @@ func (client *KubeClient) StartPodInformer(podLabelSelector string, handler cach
 		return nil, err
 	}
 
-	err = informer.SetTransform(func(x interface{}) (interface{}, error) {
-		pod := x.(*corev1.Pod).DeepCopy()
-		logrus.Tracef("Transform %s/%s", pod.Namespace, pod.Name)
-
-		return &corev1.Pod{
-				ObjectMeta: meta.ObjectMeta{
-					Name:        pod.Name,
-					Namespace:   pod.Namespace,
-					Annotations: pod.Annotations,
-					Labels:      pod.Labels,
-				},
-				Status: corev1.PodStatus{
-					InitContainerStatuses:      pod.Status.InitContainerStatuses,
-					EphemeralContainerStatuses: pod.Status.EphemeralContainerStatuses,
-					ContainerStatuses:          pod.Status.ContainerStatuses,
-				},
-				Spec: corev1.PodSpec{
-					ImagePullSecrets: pod.Spec.ImagePullSecrets,
-				},
-			},
-			nil
-	})
-
+	err = informer.SetTransform(transformPod)
 	return informer, err
+}
+
+// transformPod strips the pod down to what the operator uses. Of the spec,
+// that's the pull secrets and each container's name and image (see
+// ExtractPodInfos).
+func transformPod(x interface{}) (interface{}, error) {
+	pod := x.(*corev1.Pod).DeepCopy()
+	logrus.Tracef("Transform %s/%s", pod.Namespace, pod.Name)
+
+	spec := corev1.PodSpec{ImagePullSecrets: pod.Spec.ImagePullSecrets}
+	for _, c := range pod.Spec.Containers {
+		spec.Containers = append(spec.Containers, corev1.Container{Name: c.Name, Image: c.Image})
+	}
+	for _, c := range pod.Spec.InitContainers {
+		spec.InitContainers = append(spec.InitContainers, corev1.Container{Name: c.Name, Image: c.Image})
+	}
+	for _, c := range pod.Spec.EphemeralContainers {
+		spec.EphemeralContainers = append(spec.EphemeralContainers, corev1.EphemeralContainer{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: c.Name, Image: c.Image},
+		})
+	}
+
+	return &corev1.Pod{
+			ObjectMeta: meta.ObjectMeta{
+				Name:        pod.Name,
+				Namespace:   pod.Namespace,
+				Annotations: pod.Annotations,
+				Labels:      pod.Labels,
+			},
+			Status: corev1.PodStatus{
+				InitContainerStatuses:      pod.Status.InitContainerStatuses,
+				EphemeralContainerStatuses: pod.Status.EphemeralContainerStatuses,
+				ContainerStatuses:          pod.Status.ContainerStatuses,
+			},
+			Spec: spec,
+		},
+		nil
+}
+
+// ExtractPodInfos wraps libk8soci's ExtractPodInfos, which takes each
+// container's image from its status. For an image pinned as name:tag@digest,
+// containerd reports the status image as the bare config digest, so the tag
+// (used e.g. as the Dependency-Track project version) is lost. In that case
+// the image is taken from the pod spec instead. Images are always pulled by
+// the image ID, so that's unaffected.
+func (client *KubeClient) ExtractPodInfos(pod corev1.Pod) libk8s.PodInfo {
+	info := client.Client.ExtractPodInfos(pod)
+
+	specImages := make(map[string]string)
+	for _, c := range pod.Spec.Containers {
+		specImages[c.Name] = c.Image
+	}
+	for _, c := range pod.Spec.InitContainers {
+		specImages[c.Name] = c.Image
+	}
+	for _, c := range pod.Spec.EphemeralContainers {
+		specImages[c.Name] = c.Image
+	}
+
+	for _, c := range info.Containers {
+		if _, err := v1.NewHash(c.Image.Image); err != nil {
+			continue
+		}
+		if specImage := specImages[c.Name]; specImage != "" {
+			c.Image.Image = specImage
+		}
+	}
+
+	return info
 }
 
 func (client *KubeClient) StartNamespaceInformer(namespaceLabelSelector string, handler cache.ResourceEventHandlerFuncs) (cache.SharedIndexInformer, error) {
@@ -147,8 +196,27 @@ func (client *KubeClient) LoadPullSecrets(pods []libk8s.PodInfo) []*oci.KubeCred
 	return append(secrets, client.fallbackPullSecret...)
 }
 
+// loadPodInfos is libk8soci's LoadPodInfos, with ExtractPodInfos from above.
+func (client *KubeClient) loadPodInfos(namespaces []corev1.Namespace, podLabelSelector string) []libk8s.PodInfo {
+	podInfos := []libk8s.PodInfo{}
+	options := meta.ListOptions{LabelSelector: util.Unescape(podLabelSelector)}
+	for _, ns := range namespaces {
+		pods, err := client.Client.Client.CoreV1().Pods(ns.Name).List(context.Background(), options)
+		if err != nil {
+			logrus.WithError(err).Errorf("failed to list pods for namespace: %s", ns.Name)
+			continue
+		}
+
+		for _, pod := range pods.Items {
+			podInfos = append(podInfos, client.ExtractPodInfos(pod))
+		}
+	}
+
+	return podInfos
+}
+
 func (client *KubeClient) LoadImageInfos(namespaces []corev1.Namespace, podLabelSelector string) ([]libk8s.PodInfo, []*oci.RegistryImage) {
-	podInfos := client.Client.LoadPodInfos(namespaces, podLabelSelector)
+	podInfos := client.loadPodInfos(namespaces, podLabelSelector)
 	allImages := make([]*oci.RegistryImage, 0)
 
 	for _, pod := range podInfos {

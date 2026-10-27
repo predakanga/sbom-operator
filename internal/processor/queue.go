@@ -146,7 +146,7 @@ func (p *Processor) allowedPods() []libk8s.PodInfo {
 			continue
 		}
 
-		pods = append(pods, p.K8s.Client.ExtractPodInfos(*pod))
+		pods = append(pods, p.K8s.ExtractPodInfos(*pod))
 	}
 
 	return pods
@@ -193,7 +193,7 @@ func (p *Processor) initialSync() error {
 // informer's store still runs it.
 func (p *Processor) cleanupImageIfUnused(image *liboci.RegistryImage) {
 	for _, po := range p.podStore.List() {
-		info := p.K8s.Client.ExtractPodInfos(*po.(*corev1.Pod))
+		info := p.K8s.ExtractPodInfos(*po.(*corev1.Pod))
 		if containsContainerImage(info.Containers, image.ImageID) {
 			return
 		}
