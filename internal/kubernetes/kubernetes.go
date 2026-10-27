@@ -128,14 +128,23 @@ func loadFallbackPullSecret(client *libk8s.KubeClient, namespace, name string) [
 	return fallbackPullSecret
 }
 
-func (client *KubeClient) InjectPullSecrets(pod libk8s.PodInfo) {
-	for _, container := range pod.Containers {
-		container.Image.PullSecrets = client.Client.LoadSecrets(pod.PodNamespace, pod.PullSecretNames)
-
-		if client.fallbackPullSecret != nil {
-			container.Image.PullSecrets = append(container.Image.PullSecrets, client.fallbackPullSecret...)
+// LoadPullSecrets returns the pull secrets of all given pods, loading each
+// secret once, followed by the fallback pull secret.
+func (client *KubeClient) LoadPullSecrets(pods []libk8s.PodInfo) []*oci.KubeCreds {
+	secrets := make([]*oci.KubeCreds, 0)
+	loaded := make(map[string]bool)
+	for _, pod := range pods {
+		for _, ref := range pod.PullSecretNames {
+			key := pod.PodNamespace + "/" + ref.Name
+			if loaded[key] {
+				continue
+			}
+			loaded[key] = true
+			secrets = append(secrets, client.Client.LoadSecrets(pod.PodNamespace, []corev1.LocalObjectReference{ref})...)
 		}
 	}
+
+	return append(secrets, client.fallbackPullSecret...)
 }
 
 func (client *KubeClient) LoadImageInfos(namespaces []corev1.Namespace, podLabelSelector string) ([]libk8s.PodInfo, []*oci.RegistryImage) {

@@ -87,7 +87,7 @@ func newPod(namespace, name string, containerImages ...string) *corev1.Pod {
 func newQueueProcessor(t *testing.T, gen SbomGenerator, targets []target.Target, pods ...*corev1.Pod) (*Processor, *fakeAPIServer, cache.Store) {
 	t.Helper()
 
-	retryBaseDelay, retryMaxDelay = time.Millisecond, 10*time.Millisecond
+	retryBaseDelay, retryMaxDelay = 20*time.Millisecond, 100*time.Millisecond
 	t.Cleanup(func() { retryBaseDelay, retryMaxDelay = 30*time.Second, time.Hour })
 
 	api := &fakeAPIServer{pods: map[string]*corev1.Pod{}}
@@ -129,7 +129,7 @@ func waitForRetry(t *testing.T, p *Processor) {
 	require.Eventually(t, func() bool { return p.queue.Len() > 0 }, time.Second, time.Millisecond, "expected a retry to be queued")
 }
 
-func TestInitialSyncScansMissingPodsAndRemovesOrphans(t *testing.T) {
+func TestInitialSyncScansMissingImagesAndRemovesOrphans(t *testing.T) {
 	internal.OperatorConfig = &internal.Config{DeleteOrphanImages: true}
 
 	mysql := newPod("db", "mysql-0", "mysql", "mysql@sha256:1", "pmm-agent", "pmm-client@sha256:2")
@@ -142,23 +142,55 @@ func TestInitialSyncScansMissingPodsAndRemovesOrphans(t *testing.T) {
 
 	// the sidecar's image is running, only the stale image is an orphan
 	assert.Equal(t, []string{"old@sha256:9"}, ta.removed)
-	require.Equal(t, 1, p.queue.Len(), "the pod is queued for scanning")
+	require.Equal(t, 1, p.queue.Len(), "only the image missing from the target is queued")
 
-	// the mysql scan fails (e.g. rate limited): only the sidecar is annotated
+	// the mysql scan fails (e.g. rate limited)
 	processQueued(t, p)
-	assert.Equal(t, map[string]string{"ckotzbauer.sbom-operator.io/pmm-agent": "pmm-client@sha256:2"}, api.annotations("db/mysql-0"))
-	assert.Equal(t, 1, p.queue.NumRequeues(scanPodItem("db", "mysql-0")))
+	assert.Empty(t, api.annotations("db/mysql-0"))
+	assert.Equal(t, 1, p.queue.NumRequeues(scanImageItem("mysql@sha256:1")))
 
 	// the retry succeeds once the registry recovers
 	gen.fail = nil
 	waitForRetry(t, p)
 	processQueued(t, p)
-	assert.Equal(t, map[string]string{
-		"ckotzbauer.sbom-operator.io/mysql":     "mysql@sha256:1",
-		"ckotzbauer.sbom-operator.io/pmm-agent": "pmm-client@sha256:2",
-	}, api.annotations("db/mysql-0"))
-	assert.Equal(t, 0, p.queue.NumRequeues(scanPodItem("db", "mysql-0")))
-	assert.Equal(t, []string{"mysql@sha256:1", "pmm-client@sha256:2", "mysql@sha256:1"}, gen.scanned)
+	assert.Equal(t, map[string]string{"ckotzbauer.sbom-operator.io/mysql": "mysql@sha256:1"}, api.annotations("db/mysql-0"))
+	assert.Equal(t, 0, p.queue.NumRequeues(scanImageItem("mysql@sha256:1")))
+	assert.Equal(t, []string{"mysql@sha256:1", "mysql@sha256:1"}, gen.scanned)
+}
+
+func TestFailingImageIsRetriedOnceForAllPods(t *testing.T) {
+	internal.OperatorConfig = &internal.Config{}
+
+	pods := []*corev1.Pod{
+		newPod("redpanda", "redpanda-0", "redpanda", "redpanda@sha256:1", "sidecar", "sidecar@sha256:2"),
+		newPod("redpanda", "redpanda-1", "redpanda", "redpanda@sha256:1"),
+		newPod("redpanda", "redpanda-2", "redpanda", "redpanda@sha256:1"),
+	}
+	gen := &fakeGenerator{fail: map[string]bool{"redpanda@sha256:1": true}}
+	ta := &fakeTarget{}
+	p, api, _ := newQueueProcessor(t, gen, []target.Target{ta}, pods...)
+
+	p.queue.Add(workItem{kind: workInitialSync})
+	p.processNextWorkItem()
+	require.Equal(t, 2, p.queue.Len(), "one item per image, not per pod")
+
+	processQueued(t, p)
+	assert.Equal(t, []string{"redpanda@sha256:1", "sidecar@sha256:2"}, gen.scanned, "the failing image is fetched once, not once per pod")
+	assert.Equal(t, 1, p.queue.NumRequeues(scanImageItem("redpanda@sha256:1")))
+	assert.Equal(t, map[string]string{"ckotzbauer.sbom-operator.io/sidecar": "sidecar@sha256:2"}, api.annotations("redpanda/redpanda-0"))
+
+	// a new pod with the image doesn't bypass the backoff
+	p.queueScan("redpanda@sha256:1")
+	assert.Equal(t, 0, p.queue.Len())
+
+	gen.fail = nil
+	waitForRetry(t, p)
+	processQueued(t, p)
+	assert.Equal(t, []string{"redpanda@sha256:1", "sidecar@sha256:2", "redpanda@sha256:1"}, gen.scanned)
+	assert.Len(t, ta.received, 2, "the SBOM is uploaded once")
+	for _, name := range []string{"redpanda-0", "redpanda-1", "redpanda-2"} {
+		assert.Equal(t, "redpanda@sha256:1", api.annotations("redpanda/" + name)["ckotzbauer.sbom-operator.io/redpanda"], "every pod waiting for the image is annotated")
+	}
 }
 
 func TestTargetFailureIsRetried(t *testing.T) {
@@ -168,7 +200,7 @@ func TestTargetFailureIsRetried(t *testing.T) {
 	ta := &fakeTarget{fail: map[string]bool{"app@sha256:1": true}}
 	p, api, _ := newQueueProcessor(t, &fakeGenerator{}, []target.Target{ta}, pod)
 
-	p.queue.Add(scanPodItem("default", "app"))
+	p.queue.Add(scanImageItem("app@sha256:1"))
 	processQueued(t, p)
 	assert.Empty(t, api.annotations("default/app"))
 	assert.False(t, p.imageMap["app@sha256:1"])
@@ -197,7 +229,7 @@ func TestInitialSyncIsRetriedWhenATargetCantLoad(t *testing.T) {
 	down.loadErr = nil
 	waitForRetry(t, p)
 	p.processNextWorkItem()
-	require.Equal(t, 1, p.queue.Len(), "the pod is missing from the recovered target")
+	require.Equal(t, 1, p.queue.Len(), "the image is missing from the recovered target")
 	processQueued(t, p)
 	assert.Len(t, down.received, 1)
 }
@@ -209,11 +241,11 @@ func TestScanOfDeletedPodIsSkipped(t *testing.T) {
 	gen := &fakeGenerator{}
 	p, _, store := newQueueProcessor(t, gen, []target.Target{&fakeTarget{}}, pod)
 
-	p.queue.Add(scanPodItem("default", "app"))
+	p.queue.Add(scanImageItem("app@sha256:1"))
 	require.NoError(t, store.Delete(pod))
 	processQueued(t, p)
 	assert.Empty(t, gen.scanned)
-	assert.Equal(t, 0, p.queue.NumRequeues(scanPodItem("default", "app")))
+	assert.Equal(t, 0, p.queue.NumRequeues(scanImageItem("app@sha256:1")))
 }
 
 func TestCleanupImageIfUnused(t *testing.T) {
