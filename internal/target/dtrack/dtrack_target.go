@@ -12,6 +12,7 @@ import (
 	"time"
 
 	dtrack "github.com/DependencyTrack/client-go"
+	"github.com/distribution/reference"
 	"github.com/google/uuid"
 	parser "github.com/novln/docker-parser"
 	"github.com/sirupsen/logrus"
@@ -845,16 +846,37 @@ func getRepoWithVersion(image *libk8s.RegistryImage, useShortName bool, k8sClust
 		projectName += "-" + scope
 	}
 
+	version := imageRef.Tag()
 	if strings.Index(image.Image, "sha256") != 0 {
-		imageRef, err = parser.Parse(image.Image)
+		version, err = imageVersion(image.Image)
 		if err != nil {
 			logrus.WithError(err).Errorf("Could not parse image %s", image.Image)
 			return "", ""
 		}
 	}
 
-	version := imageRef.Tag()
 	return projectName, version
+}
+
+// imageVersion returns the tag of an image reference ("latest" if it has
+// none), or its digest if it's pinned by digest only. A reference with both
+// (name:tag@digest) yields the tag; docker-parser's Tag() returns the digest
+// for those.
+func imageVersion(image string) (string, error) {
+	ref, err := reference.ParseNormalizedNamed(image)
+	if err != nil {
+		return "", err
+	}
+
+	ref = reference.TagNameOnly(ref)
+	if tagged, ok := ref.(reference.Tagged); ok {
+		return tagged.Tag(), nil
+	}
+	if digested, ok := ref.(reference.Digested); ok {
+		return digested.Digest().String(), nil
+	}
+
+	return "", nil
 }
 
 // handleProjectDeactivation removes the current cluster tag in "tag" mode
