@@ -138,8 +138,8 @@ func (p *Processor) ListenForPods() {
 			logrus.Tracef("Pod %s/%s was updated.", newInfo.PodNamespace, newInfo.PodName)
 
 			addedContainers, removedContainers := getChangedContainers(oldInfo, newInfo)
-			if len(addedContainers) > 0 {
-				p.queue.Add(scanPodItem(newInfo.PodNamespace, newInfo.PodName))
+			for _, c := range addedContainers {
+				p.queueScan(c.Image.ImageID)
 			}
 			for _, c := range removedContainers {
 				p.queue.Add(cleanupImageItem(c.Image))
@@ -225,49 +225,74 @@ func (p *Processor) ProcessAllPods(pods []libk8s.PodInfo, allImages []*liboci.Re
 	}
 }
 
-// scanPod processes the pod's containers which aren't annotated as processed
-// yet, and annotates those that succeeded. It returns an error if any failed.
-func (p *Processor) scanPod(pod libk8s.PodInfo) error {
-	processed, err := p.processPod(pod)
-	p.K8s.UpdatePodAnnotation(pod, processed)
-	return err
+// imageScan is an image, with the containers waiting for it to be processed.
+type imageScan struct {
+	imageID string
+	pods    []podContainers
 }
 
-// processPod sends SBOMs for the images of the pod's unannotated containers to
-// all targets. It returns the containers whose image succeeded, and an error
-// if any image failed.
-func (p *Processor) processPod(pod libk8s.PodInfo) ([]*libk8s.ContainerInfo, error) {
-	p.K8s.InjectPullSecrets(pod)
-	imageIDs := make([]string, 0)
-	containersByImage := make(map[string][]*libk8s.ContainerInfo)
-	for _, container := range pod.Containers {
-		if p.K8s.HasAnnotation(pod.Annotations, container) {
-			logrus.Debugf("Skip image %s", container.Image.ImageID)
-			continue
+// podContainers are the containers of a pod that run the same image.
+type podContainers struct {
+	pod        libk8s.PodInfo
+	containers []*libk8s.ContainerInfo
+}
+
+// pendingImages groups the pods' containers that aren't annotated as
+// processed by image, in order of first appearance. Bare-digest images are
+// left out, with a warning.
+func (p *Processor) pendingImages(pods []libk8s.PodInfo) []*imageScan {
+	scans := make([]*imageScan, 0)
+	byID := make(map[string]*imageScan)
+	for _, pod := range pods {
+		for _, container := range pod.Containers {
+			imageID := container.Image.ImageID
+			if p.K8s.HasAnnotation(pod.Annotations, container) {
+				continue
+			}
+			if isBareDigest(imageID) {
+				p.warnBareDigest(pod, container)
+				continue
+			}
+
+			scan, ok := byID[imageID]
+			if !ok {
+				scan = &imageScan{imageID: imageID}
+				byID[imageID] = scan
+				scans = append(scans, scan)
+			}
+
+			last := len(scan.pods) - 1
+			if last >= 0 && scan.pods[last].pod.PodNamespace == pod.PodNamespace && scan.pods[last].pod.PodName == pod.PodName {
+				scan.pods[last].containers = append(scan.pods[last].containers, container)
+			} else {
+				scan.pods = append(scan.pods, podContainers{pod: pod, containers: []*libk8s.ContainerInfo{container}})
+			}
 		}
-		if isBareDigest(container.Image.ImageID) {
-			p.warnBareDigest(pod, container)
-			continue
-		}
-		if _, ok := containersByImage[container.Image.ImageID]; !ok {
-			imageIDs = append(imageIDs, container.Image.ImageID)
-		}
-		containersByImage[container.Image.ImageID] = append(containersByImage[container.Image.ImageID], container)
 	}
 
-	processed := make([]*libk8s.ContainerInfo, 0)
-	var errs []error
-	for _, imageID := range imageIDs {
-		containers := containersByImage[imageID]
-		if err := p.processImage(&pod, imageID, containers); err != nil {
-			logrus.WithError(err).Errorf("Failed to process image %s of pod %s/%s", imageID, pod.PodNamespace, pod.PodName)
-			errs = append(errs, err)
-			continue
-		}
-		processed = append(processed, containers...)
+	return scans
+}
+
+// scanImage sends the image's SBOMs to all targets once, and on success
+// annotates every container waiting for it. The image is pulled with the pull
+// secrets of all those pods; the first pod is the one the targets see.
+func (p *Processor) scanImage(scan *imageScan) error {
+	pods := make([]libk8s.PodInfo, 0, len(scan.pods))
+	for _, pc := range scan.pods {
+		pods = append(pods, pc.pod)
 	}
 
-	return processed, errors.Join(errs...)
+	first := scan.pods[0]
+	first.containers[0].Image.PullSecrets = p.K8s.LoadPullSecrets(pods)
+	if err := p.processImage(&first.pod, scan.imageID, first.containers); err != nil {
+		return fmt.Errorf("image %s of %d pod(s), e.g. %s/%s: %w", scan.imageID, len(pods), first.pod.PodNamespace, first.pod.PodName, err)
+	}
+
+	for _, pc := range scan.pods {
+		p.K8s.UpdatePodAnnotation(pc.pod, pc.containers)
+	}
+
+	return nil
 }
 
 // isBareDigest reports whether the image ID is only a digest, without a
@@ -461,8 +486,11 @@ func HasJobImage() bool {
 }
 
 func (p *Processor) executeSyftScans(pods []libk8s.PodInfo, allImages []*liboci.RegistryImage) {
-	for _, pod := range pods {
-		_ = p.scanPod(pod) // errors are logged, failed images are retried on the next run
+	for _, scan := range p.pendingImages(pods) {
+		if err := p.scanImage(scan); err != nil {
+			// failed images are retried on the next run
+			logrus.WithError(err).Error("Failed to process image")
+		}
 	}
 
 	for _, t := range p.Targets {
@@ -507,11 +535,11 @@ func orphanImages(targetImages []*liboci.RegistryImage, allImages []*liboci.Regi
 	return orphans
 }
 
-// findPodsToScan returns the pods that have at least one container whose image
-// is missing from any of the targets (one image list per target) and isn't
-// annotated as processed. It also returns every image running in pods,
-// deduplicated, which is what orphan detection compares the targets against.
-func (p *Processor) findPodsToScan(pods []libk8s.PodInfo, targetImages [][]*liboci.RegistryImage) ([]libk8s.PodInfo, []*liboci.RegistryImage) {
+// findImagesToScan returns the IDs of the pending images (see pendingImages)
+// that are missing from any of the targets (one image list per target). It
+// also returns every image running in pods, deduplicated, which is what orphan
+// detection compares the targets against.
+func (p *Processor) findImagesToScan(pods []libk8s.PodInfo, targetImages [][]*liboci.RegistryImage) ([]string, []*liboci.RegistryImage) {
 	targetImageSets := make([]map[string]bool, 0, len(targetImages))
 	for _, images := range targetImages {
 		set := make(map[string]bool, len(images))
@@ -521,43 +549,29 @@ func (p *Processor) findPodsToScan(pods []libk8s.PodInfo, targetImages [][]*libo
 		targetImageSets = append(targetImageSets, set)
 	}
 
-	missingPods := make([]libk8s.PodInfo, 0)
 	allImages := make([]*liboci.RegistryImage, 0)
 	seenImages := make(map[string]bool)
-
 	for _, info := range pods {
-		needsAnalysis := false
 		for _, c := range info.Containers {
-			// every container counts as running, also those after the first one needing analysis
 			if !seenImages[c.Image.ImageID] {
 				seenImages[c.Image.ImageID] = true
 				allImages = append(allImages, c.Image)
 			}
-
-			if needsAnalysis || p.K8s.HasAnnotation(info.Annotations, c) {
-				continue
-			}
-			if isBareDigest(c.Image.ImageID) {
-				// the pod may never be scanned, so warn here
-				p.warnBareDigest(info, c)
-				continue
-			}
-
-			for _, set := range targetImageSets {
-				if !set[c.Image.ImageID] {
-					needsAnalysis = true
-					break
-				}
-			}
-		}
-
-		if needsAnalysis {
-			missingPods = append(missingPods, info)
-			logrus.Debugf("Pod %s/%s needs to be analyzed", info.PodNamespace, info.PodName)
 		}
 	}
 
-	return missingPods, allImages
+	missingImages := make([]string, 0)
+	for _, scan := range p.pendingImages(pods) {
+		for _, set := range targetImageSets {
+			if !set[scan.imageID] {
+				missingImages = append(missingImages, scan.imageID)
+				logrus.Debugf("Image %s needs to be analyzed", scan.imageID)
+				break
+			}
+		}
+	}
+
+	return missingImages, allImages
 }
 
 func (p *Processor) executeJobImage(pods []libk8s.PodInfo) {

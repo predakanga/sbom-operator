@@ -9,7 +9,6 @@ import (
 	liboci "github.com/ckotzbauer/libk8soci/pkg/oci"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -21,8 +20,8 @@ import (
 type workKind int
 
 const (
-	// scan the unannotated containers of the pod with the given key
-	workScanPod workKind = iota
+	// scan the image with the given ID, for every pod waiting for it
+	workScanImage workKind = iota
 	// remove the image from the targets if no pod runs it anymore
 	workCleanupImage
 	// compare the targets with the cluster after the informer's cache synced
@@ -31,7 +30,7 @@ const (
 
 type workItem struct {
 	kind workKind
-	// pod key (namespace/name) or image ID
+	// image ID
 	key string
 	// image reference, for workCleanupImage
 	image string
@@ -47,8 +46,21 @@ func newWorkQueue() workqueue.TypedRateLimitingInterface[workItem] {
 		workqueue.NewTypedItemExponentialFailureRateLimiter[workItem](retryBaseDelay, retryMaxDelay))
 }
 
-func scanPodItem(namespace, name string) workItem {
-	return workItem{kind: workScanPod, key: cache.NewObjectName(namespace, name).String()}
+func scanImageItem(imageID string) workItem {
+	return workItem{kind: workScanImage, key: imageID}
+}
+
+// queueScan queues a scan of the image, unless a failed scan of it is waiting
+// for its retry: the retry covers every pod running the image by then, and
+// adding the item now would bypass the backoff.
+func (p *Processor) queueScan(imageID string) {
+	item := scanImageItem(imageID)
+	if p.queue.NumRequeues(item) > 0 {
+		logrus.Debugf("The %s is waiting for its retry", item)
+		return
+	}
+
+	p.queue.Add(item)
 }
 
 func cleanupImageItem(image *liboci.RegistryImage) workItem {
@@ -57,8 +69,8 @@ func cleanupImageItem(image *liboci.RegistryImage) workItem {
 
 func (i workItem) String() string {
 	switch i.kind {
-	case workScanPod:
-		return "scan of pod " + i.key
+	case workScanImage:
+		return "scan of image " + i.key
 	case workCleanupImage:
 		return "cleanup of image " + i.key
 	case workInitialSync:
@@ -94,8 +106,8 @@ func (p *Processor) processNextWorkItem() bool {
 
 func (p *Processor) handleWorkItem(item workItem) error {
 	switch item.kind {
-	case workScanPod:
-		return p.scanPodByKey(item.key)
+	case workScanImage:
+		return p.scanImageByID(item.key)
 	case workCleanupImage:
 		p.cleanupImageIfUnused(&liboci.RegistryImage{ImageID: item.key, Image: item.image})
 		return nil
@@ -106,25 +118,19 @@ func (p *Processor) handleWorkItem(item workItem) error {
 	}
 }
 
-// scanPodByKey scans the current state of the pod in the informer's store. A
-// pod that is gone, or now in a namespace that isn't allowed, is skipped.
-func (p *Processor) scanPodByKey(key string) error {
-	obj, exists, err := p.podStore.GetByKey(key)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		logrus.Debugf("Pod %s is gone, skip scan", key)
-		return nil
-	}
-
-	pod := obj.(*corev1.Pod)
-	if !p.isNamespaceAllowed(pod.Namespace) {
-		logrus.Tracef("Skipping pod %s - namespace not in allowed list", key)
-		return nil
+// scanImageByID scans the image for the pods in the informer's store whose
+// containers wait for it. Retries and their backoff are per image, so an image
+// that fails isn't fetched once per pod. If no pod waits for the image anymore
+// (gone, annotated, or in a namespace that isn't allowed), it's skipped.
+func (p *Processor) scanImageByID(imageID string) error {
+	for _, scan := range p.pendingImages(p.allowedPods()) {
+		if scan.imageID == imageID {
+			return p.scanImage(scan)
+		}
 	}
 
-	return p.scanPod(p.K8s.Client.ExtractPodInfos(*pod))
+	logrus.Debugf("No pod waits for image %s anymore, skip scan", imageID)
+	return nil
 }
 
 // allowedPods returns the pods in the informer's store, without those in
@@ -146,7 +152,7 @@ func (p *Processor) allowedPods() []libk8s.PodInfo {
 	return pods
 }
 
-// initialSync queues every pod with an image missing from a target, and
+// initialSync queues every unannotated image missing from a target, and
 // removes the targets' images that no pod runs anymore. It fails (and is
 // retried) if a target's images couldn't be loaded; the other targets are
 // still synced.
@@ -167,9 +173,9 @@ func (p *Processor) initialSync() error {
 		targetImages = append(targetImages, images)
 	}
 
-	missingPods, allImages := p.findPodsToScan(pods, targetImages)
-	for _, pod := range missingPods {
-		p.queue.Add(scanPodItem(pod.PodNamespace, pod.PodName))
+	missingImages, allImages := p.findImagesToScan(pods, targetImages)
+	for _, imageID := range missingImages {
+		p.queueScan(imageID)
 	}
 
 	for i, t := range loadedTargets {

@@ -2,6 +2,7 @@ package processor
 
 import (
 	"errors"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +16,8 @@ import (
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestInitTargets(t *testing.T) {
@@ -182,7 +185,7 @@ func images(ids ...string) []*liboci.RegistryImage {
 	return result
 }
 
-func TestFindPodsToScan(t *testing.T) {
+func TestFindImagesToScan(t *testing.T) {
 	mysqlPod := libk8s.PodInfo{
 		PodName:      "mysql-0",
 		PodNamespace: "db",
@@ -220,25 +223,25 @@ func TestFindPodsToScan(t *testing.T) {
 			name:            "later containers count as running when the first needs analysis",
 			pods:            []libk8s.PodInfo{mysqlPod},
 			targetImages:    [][]*liboci.RegistryImage{images("pmm-client@sha256:2", "busybox@sha256:3")},
-			expectedMissing: []string{"mysql-0"},
+			expectedMissing: []string{"mysql@sha256:1"},
 			expectedImages:  []string{"mysql@sha256:1", "pmm-client@sha256:2", "busybox@sha256:3"},
 		},
 		{
-			name:            "a pod missing from several targets is returned once",
+			name:            "an image missing from several targets is returned once",
 			pods:            []libk8s.PodInfo{mysqlPod},
 			targetImages:    [][]*liboci.RegistryImage{images(), images(), images()},
-			expectedMissing: []string{"mysql-0"},
+			expectedMissing: []string{"mysql@sha256:1", "pmm-client@sha256:2", "busybox@sha256:3"},
 			expectedImages:  []string{"mysql@sha256:1", "pmm-client@sha256:2", "busybox@sha256:3"},
 		},
 		{
-			name:            "a pod missing from only one target is returned",
+			name:            "an image missing from only one target is returned",
 			pods:            []libk8s.PodInfo{completePod},
 			targetImages:    [][]*liboci.RegistryImage{images("redis@sha256:5"), images()},
-			expectedMissing: []string{"redis-0"},
+			expectedMissing: []string{"redis@sha256:5"},
 			expectedImages:  []string{"redis@sha256:5"},
 		},
 		{
-			name:            "annotated and complete pods aren't returned",
+			name:            "images of annotated and complete pods aren't returned",
 			pods:            []libk8s.PodInfo{annotatedPod, completePod},
 			targetImages:    [][]*liboci.RegistryImage{images("redis@sha256:5")},
 			expectedMissing: []string{},
@@ -249,6 +252,13 @@ func TestFindPodsToScan(t *testing.T) {
 			pods:            []libk8s.PodInfo{mysqlPod, sharedImagePod},
 			targetImages:    [][]*liboci.RegistryImage{images("mysql@sha256:1", "pmm-client@sha256:2", "busybox@sha256:3")},
 			expectedMissing: []string{},
+			expectedImages:  []string{"mysql@sha256:1", "pmm-client@sha256:2", "busybox@sha256:3"},
+		},
+		{
+			name:            "an image missing for several pods is returned once",
+			pods:            []libk8s.PodInfo{mysqlPod, sharedImagePod},
+			targetImages:    [][]*liboci.RegistryImage{images("mysql@sha256:1", "busybox@sha256:3")},
+			expectedMissing: []string{"pmm-client@sha256:2"},
 			expectedImages:  []string{"mysql@sha256:1", "pmm-client@sha256:2", "busybox@sha256:3"},
 		},
 		{
@@ -263,13 +273,8 @@ func TestFindPodsToScan(t *testing.T) {
 	p := &Processor{K8s: &kubernetes.KubeClient{}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			missing, all := p.findPodsToScan(tt.pods, tt.targetImages)
-
-			missingNames := make([]string, 0)
-			for _, pod := range missing {
-				missingNames = append(missingNames, pod.PodName)
-			}
-			assert.Equal(t, tt.expectedMissing, missingNames)
+			missing, all := p.findImagesToScan(tt.pods, tt.targetImages)
+			assert.Equal(t, tt.expectedMissing, missing)
 
 			imageIDs := make([]string, 0)
 			for _, i := range all {
@@ -303,29 +308,86 @@ func containerNames(containers []*libk8s.ContainerInfo) []string {
 	return names
 }
 
-func TestProcessPod(t *testing.T) {
+func TestPendingImages(t *testing.T) {
+	bare := "sha256:7c3a6a8f5c2e1d0b9a8f7e6d5c4b3a2918273645546372819a0b1c2d3e4f5a6b"
+	pods := []libk8s.PodInfo{
+		{
+			PodName:      "mysql-0",
+			PodNamespace: "db",
+			Annotations:  map[string]string{"ckotzbauer.sbom-operator.io/done": "done@sha256:0"},
+			Containers: []*libk8s.ContainerInfo{
+				container("mysql", "mysql@sha256:1"),
+				container("pmm-agent", "pmm-client@sha256:2"),
+				container("pmm-init", "pmm-client@sha256:2"),
+				container("done", "done@sha256:0"),
+				container("imported", bare),
+			},
+		},
+		{
+			PodName:      "mysql-1",
+			PodNamespace: "db",
+			Containers:   []*libk8s.ContainerInfo{container("pmm-agent", "pmm-client@sha256:2")},
+		},
+	}
+
+	p := &Processor{K8s: &kubernetes.KubeClient{}}
+	type pending struct {
+		pod        string
+		containers []string
+	}
+	result := map[string][]pending{}
+	order := make([]string, 0)
+	for _, scan := range p.pendingImages(pods) {
+		order = append(order, scan.imageID)
+		for _, pc := range scan.pods {
+			result[scan.imageID] = append(result[scan.imageID], pending{pod: pc.pod.PodName, containers: containerNames(pc.containers)})
+		}
+	}
+
+	assert.Equal(t, []string{"mysql@sha256:1", "pmm-client@sha256:2"}, order, "annotated and bare-digest containers are left out")
+	assert.Equal(t, map[string][]pending{
+		"mysql@sha256:1":      {{pod: "mysql-0", containers: []string{"mysql"}}},
+		"pmm-client@sha256:2": {{pod: "mysql-0", containers: []string{"pmm-agent", "pmm-init"}}, {pod: "mysql-1", containers: []string{"pmm-agent"}}},
+	}, result)
+	assert.Equal(t, map[string]bool{bare: true}, p.bareDigestsWarned)
+}
+
+// scanPending scans every pending image of the pods in p's store, and returns
+// the IDs of those that failed.
+func scanPending(p *Processor) []string {
+	failed := make([]string, 0)
+	for _, scan := range p.pendingImages(p.allowedPods()) {
+		if err := p.scanImage(scan); err != nil {
+			failed = append(failed, scan.imageID)
+		}
+	}
+	return failed
+}
+
+func TestScanImage(t *testing.T) {
 	internal.OperatorConfig = &internal.Config{}
 
-	pod := libk8s.PodInfo{
-		PodName:      "mysql-0",
-		PodNamespace: "db",
-		Annotations:  map[string]string{"ckotzbauer.sbom-operator.io/done": "done@sha256:0"},
-		Containers: []*libk8s.ContainerInfo{
-			container("mysql", "mysql@sha256:1"),
-			container("pmm-agent", "pmm-client@sha256:2"),
-			container("pmm-init", "pmm-client@sha256:2"),
-			container("done", "done@sha256:0"),
-		},
+	newMysqlPod := func() *corev1.Pod {
+		pod := newPod("db", "mysql-0", "mysql", "mysql@sha256:1", "pmm-agent", "pmm-client@sha256:2", "pmm-init", "pmm-client@sha256:2", "done", "done@sha256:0")
+		pod.Annotations = map[string]string{"ckotzbauer.sbom-operator.io/done": "done@sha256:0"}
+		return pod
+	}
+	done := map[string]string{"ckotzbauer.sbom-operator.io/done": "done@sha256:0"}
+	with := func(annotations map[string]string) map[string]string {
+		maps.Copy(annotations, done)
+		return annotations
 	}
 
 	t.Run("a Syft failure fails only that image", func(t *testing.T) {
 		gen := &fakeGenerator{fail: map[string]bool{"mysql@sha256:1": true}}
 		ta := &fakeTarget{}
-		p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{ta}, imageMap: map[string]bool{}}
+		p, api, _ := newQueueProcessor(t, gen, []target.Target{ta}, newMysqlPod())
 
-		processed, err := p.processPod(pod)
-		assert.Error(t, err)
-		assert.Equal(t, []string{"pmm-agent", "pmm-init"}, containerNames(processed))
+		assert.Equal(t, []string{"mysql@sha256:1"}, scanPending(p))
+		assert.Equal(t, with(map[string]string{
+			"ckotzbauer.sbom-operator.io/pmm-agent": "pmm-client@sha256:2",
+			"ckotzbauer.sbom-operator.io/pmm-init":  "pmm-client@sha256:2",
+		}), api.annotations("db/mysql-0"))
 		assert.Equal(t, []string{"mysql@sha256:1", "pmm-client@sha256:2"}, gen.scanned, "each image is scanned once, annotated containers are skipped")
 		assert.Equal(t, map[string]bool{"pmm-client@sha256:2": true}, p.imageMap)
 		assert.Len(t, ta.received, 1)
@@ -335,42 +397,34 @@ func TestProcessPod(t *testing.T) {
 		gen := &fakeGenerator{}
 		ok := &fakeTarget{}
 		failing := &fakeTarget{fail: map[string]bool{"pmm-client@sha256:2": true}}
-		p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{ok, failing}, imageMap: map[string]bool{}}
+		p, api, store := newQueueProcessor(t, gen, []target.Target{ok, failing}, newMysqlPod())
 
-		processed, err := p.processPod(pod)
-		assert.Error(t, err)
-		assert.Equal(t, []string{"mysql"}, containerNames(processed))
+		assert.Equal(t, []string{"pmm-client@sha256:2"}, scanPending(p))
+		assert.Equal(t, with(map[string]string{"ckotzbauer.sbom-operator.io/mysql": "mysql@sha256:1"}), api.annotations("db/mysql-0"))
 		assert.False(t, p.imageMap["pmm-client@sha256:2"])
 
 		// once the target recovers, the image is sent again
 		failing.fail = nil
-		processed, err = p.processPod(pod)
-		assert.NoError(t, err)
-		assert.Equal(t, []string{"mysql", "pmm-agent", "pmm-init"}, containerNames(processed))
+		pod := newMysqlPod()
+		pod.Annotations = api.annotations("db/mysql-0")
+		require.NoError(t, store.Update(pod))
+		assert.Empty(t, scanPending(p))
+		assert.Equal(t, with(map[string]string{
+			"ckotzbauer.sbom-operator.io/mysql":     "mysql@sha256:1",
+			"ckotzbauer.sbom-operator.io/pmm-agent": "pmm-client@sha256:2",
+			"ckotzbauer.sbom-operator.io/pmm-init":  "pmm-client@sha256:2",
+		}), api.annotations("db/mysql-0"))
 		assert.Equal(t, []string{"mysql@sha256:1", "pmm-client@sha256:2", "pmm-client@sha256:2"}, gen.scanned, "only the failed image is scanned again")
 	})
 
-	t.Run("another pod's failure doesn't count as processed", func(t *testing.T) {
-		gen := &fakeGenerator{fail: map[string]bool{"pmm-client@sha256:2": true}}
-		p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{&fakeTarget{}}, imageMap: map[string]bool{}}
-
-		_, err := p.processPod(pod)
-		assert.Error(t, err)
-
-		other := libk8s.PodInfo{PodName: "mysql-1", PodNamespace: "db", Containers: []*libk8s.ContainerInfo{container("pmm-agent", "pmm-client@sha256:2")}}
-		processed, err := p.processPod(other)
-		assert.Error(t, err)
-		assert.Empty(t, processed)
-	})
-
-	t.Run("images processed for another pod aren't sent again", func(t *testing.T) {
+	t.Run("images processed before aren't sent again", func(t *testing.T) {
 		gen := &fakeGenerator{}
 		ta := &fakeTarget{}
-		p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{ta}, imageMap: map[string]bool{"mysql@sha256:1": true, "pmm-client@sha256:2": true}}
+		p, api, _ := newQueueProcessor(t, gen, []target.Target{ta}, newMysqlPod())
+		p.imageMap = map[string]bool{"mysql@sha256:1": true, "pmm-client@sha256:2": true}
 
-		processed, err := p.processPod(pod)
-		assert.NoError(t, err)
-		assert.Equal(t, []string{"mysql", "pmm-agent", "pmm-init"}, containerNames(processed))
+		assert.Empty(t, scanPending(p))
+		assert.Len(t, api.annotations("db/mysql-0"), 4)
 		assert.Empty(t, gen.scanned)
 		assert.Empty(t, ta.received)
 	})
@@ -401,30 +455,14 @@ func TestBareDigestImagesAreSkipped(t *testing.T) {
 	internal.OperatorConfig = &internal.Config{}
 	bare := "sha256:7c3a6a8f5c2e1d0b9a8f7e6d5c4b3a2918273645546372819a0b1c2d3e4f5a6b"
 
-	pod := libk8s.PodInfo{
-		PodName:      "coredns-0",
-		PodNamespace: "kube-system",
-		Containers: []*libk8s.ContainerInfo{
-			container("coredns", bare),
-			container("sidecar", "envoy@sha256:1"),
-		},
-	}
-
+	coredns := newPod("kube-system", "coredns-0", "coredns", bare, "sidecar", "envoy@sha256:1")
 	gen := &fakeGenerator{}
-	p := &Processor{K8s: &kubernetes.KubeClient{}, sy: gen, Targets: []target.Target{&fakeTarget{}}, imageMap: map[string]bool{}}
+	p, api, _ := newQueueProcessor(t, gen, []target.Target{&fakeTarget{}}, coredns)
 
-	processed, err := p.processPod(pod)
-	assert.NoError(t, err, "a bare digest isn't a failure, so it isn't retried")
-	assert.Equal(t, []string{"sidecar"}, containerNames(processed), "and isn't annotated")
+	assert.Empty(t, scanPending(p), "a bare digest isn't a failure, so it isn't retried")
+	assert.Equal(t, map[string]string{"ckotzbauer.sbom-operator.io/sidecar": "envoy@sha256:1"}, api.annotations("kube-system/coredns-0"), "and isn't annotated")
 	assert.Equal(t, []string{"envoy@sha256:1"}, gen.scanned)
-
-	_, err = p.processPod(pod)
-	assert.NoError(t, err)
 	assert.Equal(t, map[string]bool{bare: true}, p.bareDigestsWarned)
-
-	onlyBare := libk8s.PodInfo{PodName: "coredns-1", PodNamespace: "kube-system", Containers: []*libk8s.ContainerInfo{container("coredns", bare)}}
-	missing, _ := p.findPodsToScan([]libk8s.PodInfo{onlyBare}, [][]*liboci.RegistryImage{images()})
-	assert.Empty(t, missing, "a bare digest alone doesn't make a pod need analysis")
 }
 
 func TestBareDigestWarningDuringInitialSync(t *testing.T) {
@@ -440,9 +478,9 @@ func TestBareDigestWarningDuringInitialSync(t *testing.T) {
 		{PodName: "coredns-1", PodNamespace: "kube-system", Containers: []*libk8s.ContainerInfo{container("coredns", bare)}},
 	}
 	p := &Processor{K8s: &kubernetes.KubeClient{}}
-	missing, _ := p.findPodsToScan(pods, [][]*liboci.RegistryImage{images()})
-	assert.Empty(t, missing, "a bare digest alone doesn't make a pod need analysis")
-	p.findPodsToScan(pods, [][]*liboci.RegistryImage{images()})
+	missing, _ := p.findImagesToScan(pods, [][]*liboci.RegistryImage{images()})
+	assert.Empty(t, missing, "a bare digest alone doesn't make an image need analysis")
+	p.findImagesToScan(pods, [][]*liboci.RegistryImage{images()})
 
 	warnings := 0
 	for _, e := range hook.AllEntries() {

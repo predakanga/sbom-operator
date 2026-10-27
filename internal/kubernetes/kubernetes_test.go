@@ -1,12 +1,21 @@
 package kubernetes
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	libk8s "github.com/ckotzbauer/libk8soci/pkg/kubernetes"
 	"github.com/ckotzbauer/libk8soci/pkg/oci"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sclient "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 func containerInfo(name, imageID string) *libk8s.ContainerInfo {
@@ -83,4 +92,40 @@ func TestNormaliseImageID(t *testing.T) {
 	assert.Equal(t, "app@sha256:1", normaliseImageID("docker-pullable://app@sha256:1"))
 	assert.Equal(t, "app@sha256:1", normaliseImageID("app@sha256:1"))
 	assert.Equal(t, "sha256:1", normaliseImageID("sha256:1"))
+}
+
+func TestLoadPullSecrets(t *testing.T) {
+	// serves every requested secret as a (credential-less) docker config
+	var gets atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// /api/v1/namespaces/<ns>/secrets/<name>
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/namespaces/"), "/")
+		gets.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&corev1.Secret{
+			ObjectMeta: meta.ObjectMeta{Namespace: parts[0], Name: parts[2]},
+			Type:       corev1.SecretTypeDockerConfigJson,
+			Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{}}`)},
+		})
+	}))
+	t.Cleanup(ts.Close)
+	cs, err := k8sclient.NewForConfig(&rest.Config{Host: ts.URL, ContentConfig: rest.ContentConfig{ContentType: "application/json"}})
+	require.NoError(t, err)
+	fallback := &oci.KubeCreds{SecretName: "fallback"}
+	client := &KubeClient{Client: &libk8s.KubeClient{Client: cs}, fallbackPullSecret: []*oci.KubeCreds{fallback}}
+
+	pods := []libk8s.PodInfo{
+		{PodNamespace: "a", PodName: "app-0", PullSecretNames: []corev1.LocalObjectReference{{Name: "regcred"}}},
+		{PodNamespace: "a", PodName: "app-1", PullSecretNames: []corev1.LocalObjectReference{{Name: "regcred"}}},
+		{PodNamespace: "b", PodName: "app-2", PullSecretNames: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "other"}}},
+		{PodNamespace: "c", PodName: "app-3"},
+	}
+
+	names := make([]string, 0)
+	for _, s := range client.LoadPullSecrets(pods) {
+		names = append(names, s.SecretName)
+	}
+	assert.Equal(t, []string{"regcred", "regcred", "other", "fallback"}, names, "each pod's secrets, loaded once per namespace, then the fallback")
+
+	assert.Equal(t, int32(3), gets.Load())
 }
