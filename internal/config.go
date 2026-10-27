@@ -46,6 +46,8 @@ type Config struct {
 	StripCpes                        bool     `yaml:"stripCpes" env:"SBOM_STRIP_CPES" flag:"strip-cpes"`
 	Verbosity                        string   `env:"SBOM_VERBOSITY" flag:"verbosity"`
 	FetchOciAttestations             bool     `yaml:"fetchOciAttestations" env:"FETCH_OCI_ATTESTATIONS" flag:"fetch-oci-attestations"`
+	Generator                        string   `yaml:"generator" env:"SBOM_GENERATOR" flag:"generator"`
+	TrivyCacheDir                    string   `yaml:"trivyCacheDir" env:"SBOM_TRIVY_CACHE_DIR" flag:"trivy-cache-dir"`
 }
 
 var (
@@ -94,6 +96,8 @@ var (
 	ConfigKeyRegistryProxy      = "registry-proxy"
 	ConfigKeyFormatVersion      = "format-version"
 	ConfigKeyStripCpes          = "strip-cpes"
+	ConfigKeyGenerator          = "generator"
+	ConfigKeyTrivyCacheDir      = "trivy-cache-dir"
 
 	OperatorConfig *Config
 )

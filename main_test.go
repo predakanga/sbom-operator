@@ -482,3 +482,53 @@ func TestHelpBypassesFormatVersionValidation(t *testing.T) {
 
 	require.NoError(t, cmd.Execute())
 }
+
+func TestValidateGenerator_StartupBoundary(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantErrSub string
+	}{
+		{
+			name: "syft is the default",
+			args: []string{"--format", "cyclonedx", "--format-version", "1.6"},
+		},
+		{
+			name: "trivy with CycloneDX JSON",
+			args: []string{"--generator", "trivy", "--format", "cyclonedxjson"},
+		},
+		{
+			name:       "trivy with CycloneDX XML",
+			args:       []string{"--generator", "trivy", "--format", "cyclonedx"},
+			wantErrSub: "isn't supported by the trivy generator",
+		},
+		{
+			name:       "trivy with a format version",
+			args:       []string{"--generator", "trivy", "--format", "cyclonedxjson", "--format-version", "1.6"},
+			wantErrSub: "--format-version",
+		},
+		{
+			name:       "unknown generator",
+			args:       []string{"--generator", "grype"},
+			wantErrSub: "unknown generator",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := newRootCmd()
+			cmd.SetArgs(tt.args)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			cmd.Run = func(cmd *cobra.Command, args []string) {}
+
+			err := cmd.Execute()
+			if tt.wantErrSub == "" {
+				assert.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrSub)
+			}
+		})
+	}
+}

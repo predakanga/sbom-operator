@@ -53,6 +53,9 @@ sbom-git-operator/
 │   ├── syft/
 │   │   ├── syft.go                  # Syft integration: SBOM creation, format encoding, GCP Workload Identity
 │   │   └── syft_test.go             # Integration tests against real container images (alpine, redis, node, fedora)
+│   ├── trivy/
+│   │   ├── trivy.go                 # Trivy generator (--generator=trivy): runs the trivy CLI, passes credentials via a temp Docker config
+│   │   └── trivy_test.go            # Args, Docker config and env tests with a fake runner
 │   └── target/
 │       ├── target.go                # Target interface definition (Initialize, ValidateConfig, ProcessSbom, LoadImages, Remove)
 │       ├── git/
@@ -118,6 +121,10 @@ type DeactivateTarget interface {
 ```
 
 When `ShouldDeactivateOrphans()` returns true, the processor calls `Deactivate()` (rather than `Remove()`) for orphaned images, regardless of the global `--delete-orphan-images` flag. Other targets do not implement it and fall back to `Remove()`.
+
+### SBOM Generators
+
+`--generator` picks what creates SBOMs for images without a usable attestation, behind the `processor.SbomGenerator` interface (its method is still named `ExecuteSyft`). `syft` (default) runs Syft in-process. `trivy` runs the `trivy` CLI bundled in the image (`internal/trivy`), writing pull-secret credentials to a temporary Docker config per scan and passing only `PATH`, proxy, TLS and `TRIVY_*` variables to it. Trivy's SBOMs suit Dependency-Track's Trivy analyzer: Syft names distros like `almalinux` where Trivy expects `alma`, and omits source packages, so the analyzer finds little in Syft SBOMs. Trivy only writes `cyclonedxjson`, `spdxjson` and `spdx`, at its own spec version; startup rejects other formats and any `--format-version`.
 
 ### Job Image Mode
 
